@@ -14,7 +14,8 @@ from bs4 import BeautifulSoup
 import yfinance as yf
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
-from IPython.display import display, HTML
+import streamlit as st
+import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
@@ -894,6 +895,12 @@ def generate_v39_dashboard(query):
     print(f"✅ [{data['name']}] v39.0 대시보드 렌더링 완료!")
     display(HTML(html_content))
 
-# 8. 실행
-user_query = input("분석할 종목명 또는 코드를 입력하세요 (예: 178920, 삼성전자, 케이카, 329200): ")
-generate_v39_dashboard(user_query)
+# 8. Streamlit 웹 화면 실행부
+st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
+
+user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="178920")
+
+if user_query:
+    with st.spinner('데이터를 수집하고 대시보드를 생성하는 중입니다...'):
+        # 기존 렌더링 함수 안에서 display(HTML(html_content)) 대신 
+        # HTML 문자열을 리턴받거나 아래와 같이 처리되도록 수정해야 합니다.

@@ -1,6 +1,7 @@
 # ============================================================
-# [v39.3] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 종목 검색 자동완성 리스트 + 다중 가격 데이터 소스 폴백
+# [v39.4] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 네이버 자동완성 API를 활용한 종목 검색 리스트
+#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
 
 import os
@@ -20,7 +21,75 @@ import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-# ---------- 헬퍼 함수 ----------
+# ---------- 네이버 금융 자동완성 검색 API ----------
+def search_stock_list(query):
+    """
+    네이버 금융 자동완성 API를 이용하여 검색어에 해당하는 종목 리스트를 반환한다.
+    Returns: list of dict [{"code": "000660", "name": "SK하이닉스"}]
+    """
+    url = "https://ac.finance.naver.com/ac"
+    params = {
+        "q": query,
+        "target": "stock",
+        "mode": "json"
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        items = data.get("items", [])
+        result = []
+        for item in items:
+            # item 구조: [["000660","SK하이닉스"], ...]
+            if isinstance(item, list) and len(item) >= 2:
+                code = item[0]
+                name = item[1]
+                # 잡다한 태그 제거
+                name = re.sub(r'<[^>]+>', '', name).strip()
+                result.append({"code": code, "name": name})
+        return result
+    except Exception as e:
+        logging.warning(f"네이버 자동완성 검색 실패: {e}")
+        return []
+
+
+# ---------- 종목명 & 코드 정밀 매칭 (내부용, 자동완성 실패 시 사용) ----------
+def get_code_and_name(query):
+    global krx_df
+    query = query.strip()
+
+    if query.isdigit() and len(query) == 6:
+        code = query
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            name_elem = soup.select_one('.wrap_company h2 a')
+            if name_elem:
+                return code, name_elem.text.strip()
+        except Exception:
+            pass
+        return code, code
+
+    if krx_df is None:
+        try:
+            krx_df = fdr.StockListing('KRX')
+        except Exception:
+            krx_df = pd.DataFrame()
+
+    if not krx_df.empty:
+        exact = krx_df[krx_df['Name'] == query]
+        if not exact.empty:
+            return exact.iloc[0]['Code'], exact.iloc[0]['Name']
+        partial = krx_df[krx_df['Name'].str.contains(query, case=False, na=False)]
+        if not partial.empty:
+            return partial.iloc[0]['Code'], partial.iloc[0]['Name']
+
+    return query, query
+
+
+# ---------- 네이버 월봉 가격 데이터 스크래핑 ----------
 def _get_naver_monthly_price(code):
     """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
     url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
@@ -28,7 +97,6 @@ def _get_naver_monthly_price(code):
     try:
         res = requests.get(url, headers=headers, timeout=10)
         res.encoding = 'cp949'
-        soup = BeautifulSoup(res.text, 'html.parser')
         tables = pd.read_html(StringIO(res.text), encoding='cp949')
         if tables:
             df = tables[0].copy()
@@ -47,6 +115,7 @@ def _get_naver_monthly_price(code):
     return pd.DataFrame()
 
 
+# ---------- 가격 데이터 다중 소스 폴백 ----------
 def get_price_data(code, name, start_date):
     """
     가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
@@ -82,53 +151,6 @@ def get_price_data(code, name, start_date):
         return df_naver
 
     return pd.DataFrame()
-
-
-# ---------- 종목 리스트 캐싱 ----------
-@st.cache_data(ttl=3600)
-def load_krx_list():
-    try:
-        krx_df = fdr.StockListing('KRX')
-        if krx_df is not None and not krx_df.empty:
-            return krx_df[['Code', 'Name']].copy()
-    except Exception as e:
-        logging.warning(f"KRX 목록 로드 실패: {e}")
-    return pd.DataFrame(columns=['Code', 'Name'])
-
-
-# ---------- 종목명 & 코드 정밀 매칭 (내부용) ----------
-def get_code_and_name(query):
-    global krx_df
-    query = query.strip()
-
-    if query.isdigit() and len(query) == 6:
-        code = query
-        try:
-            url = f"https://finance.naver.com/item/main.naver?code={code}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            name_elem = soup.select_one('.wrap_company h2 a')
-            if name_elem:
-                return code, name_elem.text.strip()
-        except Exception:
-            pass
-        return code, code
-
-    if krx_df is None:
-        try:
-            krx_df = fdr.StockListing('KRX')
-        except Exception:
-            krx_df = pd.DataFrame()
-
-    if not krx_df.empty:
-        exact = krx_df[krx_df['Name'] == query]
-        if not exact.empty:
-            return exact.iloc[0]['Code'], exact.iloc[0]['Name']
-        partial = krx_df[krx_df['Name'].str.contains(query, case=False, na=False)]
-        if not partial.empty:
-            return partial.iloc[0]['Code'], partial.iloc[0]['Name']
-
-    return query, query
 
 
 # ---------- DPS 자동 크롤링 ----------
@@ -493,7 +515,6 @@ def calculate_multi_period_engine(code, name):
 
 # ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
-    # code와 name이 명시적으로 제공되면 내부 해석 생략
     if code is None or name is None:
         code, name = get_code_and_name(query)
     if not code:
@@ -1044,7 +1065,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.3 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.4 대시보드 렌더링 완료!")
     return html_content
 
 
@@ -1052,11 +1073,9 @@ def generate_v39_dashboard(query, code=None, name=None):
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-st.markdown("종목명 또는 코드를 입력하세요. 종목명은 부분 검색이 가능하며, 여러 결과가 나오면 선택할 수 있습니다.")
+st.markdown("종목명 또는 코드를 입력하세요. **검색어에 해당하는 종목이 리스트로 표시**됩니다.")
 
-krx_df = load_krx_list()  # 캐시된 종목 리스트
-
-user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스)", value="")
+user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스, 맥쿼리)", value="")
 
 if user_query:
     user_query = user_query.strip()
@@ -1066,52 +1085,36 @@ if user_query:
     # 1) 6자리 숫자 코드 입력
     if user_query.isdigit() and len(user_query) == 6:
         selected_code = user_query
-        # 종목명이 리스트에 있으면 가져오고, 없으면 네이버에서 시도
-        if not krx_df.empty:
-            match = krx_df[krx_df['Code'] == selected_code]
-            if not match.empty:
-                selected_name = match.iloc[0]['Name']
-        if selected_name is None:
-            try:
-                url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
-                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                name_elem = soup.select_one('.wrap_company h2 a')
-                if name_elem:
-                    selected_name = name_elem.text.strip()
-            except Exception:
-                pass
+        # 종목명을 네이버에서 가져오기 시도
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            name_elem = soup.select_one('.wrap_company h2 a')
+            if name_elem:
+                selected_name = name_elem.text.strip()
+        except Exception:
+            pass
         if selected_name is None:
             selected_name = selected_code  # fallback
 
-    # 2) 종목명 부분 검색
+    # 2) 종목명 또는 부분 검색어 -> 네이버 자동완성 API로 리스트 검색
     else:
-        if not krx_df.empty:
-            # 2-1) 정확한 일치
-            exact = krx_df[krx_df['Name'] == user_query]
-            if not exact.empty:
-                selected_code = exact.iloc[0]['Code']
-                selected_name = exact.iloc[0]['Name']
-            else:
-                # 2-2) 부분 일치 (포함)
-                partial = krx_df[krx_df['Name'].str.contains(user_query, case=False, na=False)]
-                if len(partial) == 0:
-                    st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
-                elif len(partial) == 1:
-                    selected_code = partial.iloc[0]['Code']
-                    selected_name = partial.iloc[0]['Name']
-                else:
-                    # 여러 종목이 검색되면 리스트로 표시
-                    st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(partial)}개)")
-                    options = [f"{row['Name']} ({row['Code']})" for _, row in partial.iterrows()]
-                    selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
-                    if selected_option:
-                        # 선택된 문자열에서 코드 추출
-                        code_part = selected_option.split('(')[-1].rstrip(')')
-                        selected_code = code_part
-                        selected_name = selected_option.split(' (')[0]
+        search_results = search_stock_list(user_query)
+        if not search_results:
+            st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
+        elif len(search_results) == 1:
+            selected_code = search_results[0]["code"]
+            selected_name = search_results[0]["name"]
         else:
-            st.warning("종목 리스트를 불러오지 못했습니다. 6자리 코드로만 검색 가능합니다.")
+            # 여러 종목이 검색되면 리스트로 표시
+            st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
+            options = [f"{item['name']} ({item['code']})" for item in search_results]
+            selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
+            if selected_option:
+                code_part = selected_option.split('(')[-1].rstrip(')')
+                selected_code = code_part
+                selected_name = selected_option.split(' (')[0]
 
     # 3) 분석 실행
     if selected_code and selected_name:

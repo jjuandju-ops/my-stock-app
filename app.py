@@ -1,7 +1,7 @@
 # ============================================================
-# [v39.7] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 로컬 CSV 기반 종목 검색 (외부 API 차단 대응)
-#         - 내장 주요 종목 폴백 리스트 포함
+# [v39.4] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 네이버 자동완성 API를 활용한 종목 검색 리스트
+#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
 
 import os
@@ -21,68 +21,243 @@ import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-# ---------- CSV 파일에서 종목 리스트 로드 ----------
-@st.cache_data(ttl=3600)
-def load_stock_list_from_csv():
-    """로컬 CSV 파일에서 종목 리스트를 읽어온다."""
-    csv_path = "krx_stocks.csv"
-    if os.path.exists(csv_path):
+# ---------- 종목 검색 데이터 ----------
+# 검색은 네이버 자동완성에만 의존하지 않고 KRX 전체 종목 목록을 함께 사용한다.
+# 특히 "부동산"처럼 종목명 중간에 포함된 문자열도 모두 찾는다.
+krx_df = pd.DataFrame()
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_krx_listing():
+    """국내 주식/ETF 종목명 검색용 전체 목록. FDR 단일 장애를 피하기 위해 Naver API를 폴백으로 사용."""
+    frames = []
+
+    def normalize(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Code", "Name"])
+        code_col = next((c for c in ["Code", "Symbol", "symbolCode", "itemcode"] if c in df.columns), None)
+        name_col = next((c for c in ["Name", "name", "stockName", "stockNameKor", "stockNameEng", "itemname"] if c in df.columns), None)
+        if code_col is None or name_col is None:
+            return pd.DataFrame(columns=["Code", "Name"])
+        out = df[[code_col, name_col]].copy()
+        out.columns = ["Code", "Name"]
+        out["Code"] = out["Code"].astype(str).str.extract(r"(\d{6})", expand=False)
+        out["Name"] = out["Name"].astype(str).str.replace(r"<[^>]+>", "", regex=True).str.replace("\xa0", " ", regex=False).str.strip()
+        out = out.dropna(subset=["Code", "Name"])
+        out = out[(out["Code"].str.len() == 6) & (out["Name"] != "") & (out["Name"].str.lower() != "nan")]
+        return out.drop_duplicates("Code")
+
+    # FDR: KRX가 정상인 환경에서는 가장 빠른 경로
+    for market in ["KRX", "KRX-DESC", "KOSPI", "KOSDAQ", "KONEX"]:
         try:
-            df = pd.read_csv(csv_path, dtype={'Code': str})
-            if 'Code' in df.columns and 'Name' in df.columns:
-                return df[['Code', 'Name']].astype(str)
+            n = normalize(fdr.StockListing(market))
+            if not n.empty:
+                frames.append(n)
         except Exception as e:
-            logging.warning(f"CSV 파일 로드 실패: {e}")
-    return pd.DataFrame(columns=['Code', 'Name'])
+            logging.warning("FDR %s 실패: %s", market, e)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
+        "Referer": "https://finance.naver.com/",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
+    def naver_exchange(exchange):
+        rows = []
+        size = 100
+        try:
+            first = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page=1&pageSize={size}", headers=headers, timeout=10)
+            first.raise_for_status()
+            obj = first.json()
+            total = int(obj.get("totalCount", 0) or 0)
+            pages = min(max(1, (total + size - 1) // size), 100)
+            all_pages = [obj]
+            for page in range(2, pages + 1):
+                try:
+                    rr = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page={page}&pageSize={size}", headers=headers, timeout=10)
+                    rr.raise_for_status()
+                    all_pages.append(rr.json())
+                except Exception as e:
+                    logging.warning("Naver %s page %d 실패: %s", exchange, page, e)
+                    break
+            for page_obj in all_pages:
+                for item in page_obj.get("stocks", []) or []:
+                    code = str(item.get("symbolCode", "")).strip()
+                    name = (item.get("stockName") or item.get("stockNameKor") or item.get("stockNameEng") or item.get("name") or "")
+                    name = re.sub(r"<[^>]+>", "", str(name)).strip()
+                    if re.fullmatch(r"\d{6}", code) and name:
+                        rows.append({"Code": code, "Name": name})
+        except Exception as e:
+            logging.warning("Naver %s 목록 실패: %s", exchange, e)
+        return normalize(pd.DataFrame(rows))
+
+    for exchange in ["KOSPI", "KOSDAQ", "KONEX"]:
+        n = naver_exchange(exchange)
+        if not n.empty:
+            frames.append(n)
+
+    # ETF도 종목명 검색 대상에 포함
+    try:
+        r = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", headers=headers, timeout=10)
+        r.raise_for_status()
+        etfs = r.json().get("result", {}).get("etfItemList", []) or []
+        rows = [{"Code": str(x.get("itemcode", "")).strip(), "Name": str(x.get("itemname", "")).strip()} for x in etfs]
+        n = normalize(pd.DataFrame(rows))
+        if not n.empty:
+            frames.append(n)
+    except Exception as e:
+        logging.warning("Naver ETF 목록 실패: %s", e)
+
+    if not frames:
+        logging.error("국내 종목 목록을 확보하지 못했습니다.")
+        return pd.DataFrame(columns=["Code", "Name"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out["Code"] = out["Code"].astype(str).str.zfill(6)
+    out["Name"] = out["Name"].astype(str).str.strip()
+    out = out.drop_duplicates("Code").reset_index(drop=True)
+    logging.info("국내 검색 DB 확보: %d개", len(out))
+    return out
 
 
-# ---------- 내장 주요 종목 폴백 리스트 ----------
-FALLBACK_STOCK_LIST = pd.DataFrame([
-    {"Code": "005930", "Name": "삼성전자"},
-    {"Code": "000660", "Name": "SK하이닉스"},
-    {"Code": "035420", "Name": "NAVER"},
-    {"Code": "035720", "Name": "카카오"},
-    {"Code": "005380", "Name": "현대차"},
-    {"Code": "000270", "Name": "기아"},
-    {"Code": "105560", "Name": "KB금융"},
-    {"Code": "055550", "Name": "신한지주"},
-    {"Code": "086790", "Name": "하나금융지주"},
-    {"Code": "032830", "Name": "삼성생명"},
-    {"Code": "051910", "Name": "LG화학"},
-    {"Code": "006400", "Name": "삼성SDI"},
-    {"Code": "005490", "Name": "POSCO홀딩스"},
-    {"Code": "373220", "Name": "LG에너지솔루션"},
-    {"Code": "017670", "Name": "SK텔레콤"},
-    {"Code": "030200", "Name": "KT"},
-    {"Code": "032640", "Name": "LG유플러스"},
-    {"Code": "009150", "Name": "삼성전기"},
-    {"Code": "066570", "Name": "LG전자"},
-    {"Code": "000810", "Name": "삼성화재"},
-    {"Code": "024110", "Name": "기업은행"},
-    {"Code": "316140", "Name": "우리금융지주"},
-    {"Code": "139480", "Name": "이마트"},
-    {"Code": "023530", "Name": "롯데쇼핑"},
-    {"Code": "035250", "Name": "강원랜드"},
-    {"Code": "011170", "Name": "호텔신라"},
-    {"Code": "010130", "Name": "고려아연"},
-    {"Code": "011070", "Name": "LG이노텍"},
-    {"Code": "018260", "Name": "삼성에스디에스"},
-    {"Code": "028260", "Name": "삼성물산"},
-])
+def search_naver_autocomplete(query):
+    """네이버 자동완성 검색. 실패해도 전체 검색은 계속 진행한다."""
+    url = "https://ac.finance.naver.com/ac"
+    params = {
+        "q": query,
+        "target": "stock",
+        "mode": "json"
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        result = []
+        for item in data.get('items', []):
+            if isinstance(item, list) and len(item) >= 2:
+                code = str(item[0]).strip()
+                name = re.sub(r'<[^>]+>', '', str(item[1])).strip()
+                if re.fullmatch(r'\d{6}', code) and name:
+                    result.append({'code': code, 'name': name})
+        return result
+    except Exception as e:
+        logging.warning(f"네이버 자동완성 검색 실패: {e}")
+        return []
 
 
-# ---------- 전체 종목 리스트 로딩 (CSV 우선) ----------
-@st.cache_data(ttl=3600)
-def get_stock_list():
-    """CSV 파일 → 내장 리스트 순으로 종목 리스트를 반환한다."""
-    df_csv = load_stock_list_from_csv()
-    if not df_csv.empty:
-        return df_csv
-    return FALLBACK_STOCK_LIST.copy()
+def search_stock_list(query, max_results=200):
+    """
+    종목명/코드 검색의 통합 엔진.
+
+    우선순위:
+      1. 네이버 자동완성 결과
+      2. KRX 전체 목록에서 '종목명에 검색어가 포함'된 모든 종목
+
+    예:
+      '부동산' -> 이름에 '부동산'이 들어있는 KRX 종목을 전부 반환
+      '하이닉스' -> SK하이닉스 등 부분일치 결과 반환
+      '005930' -> 삼성전자 반환
+    """
+    query = str(query or '').strip()
+    if not query:
+        return []
+
+    # 숫자 코드 검색
+    if query.isdigit():
+        qcode = query.zfill(6)
+        if len(qcode) == 6:
+            df = load_krx_listing()
+            if not df.empty:
+                hit = df[df['Code'] == qcode]
+                if not hit.empty:
+                    return [
+                        {'code': str(r.Code), 'name': str(r.Name)}
+                        for r in hit.itertuples(index=False)
+                    ]
+            # KRX 목록이 일시적으로 실패하면 네이버 자동완성도 시도
+            return search_naver_autocomplete(query)
+        return []
+
+    q = query.casefold()
+    results = []
+
+    # 1) 네이버 자동완성 결과를 먼저 확보
+    results.extend(search_naver_autocomplete(query))
+
+    # 2) KRX 전체 목록에서 '종목명 부분일치' 검색
+    df = load_krx_listing()
+    if not df.empty:
+        names = df['Name'].astype(str)
+        mask = names.str.casefold().str.contains(q, regex=False, na=False)
+        hits = df.loc[mask, ['Code', 'Name']]
+
+        # 검색어가 이름에 정확히/앞부분에 가까운 종목을 먼저 배치
+        exact = hits[hits['Name'].str.casefold() == q]
+        starts = hits[
+            hits['Name'].str.casefold().str.startswith(q) &
+            (hits['Name'].str.casefold() != q)
+        ]
+        contains = hits[
+            ~hits['Name'].str.casefold().str.startswith(q)
+        ]
+
+        ordered = pd.concat([exact, starts, contains], ignore_index=True)
+        results.extend(
+            {'code': str(r.Code), 'name': str(r.Name)}
+            for r in ordered.itertuples(index=False)
+        )
+
+    # 중복 제거 + 최대 결과 수 제한
+    unique = []
+    seen = set()
+    for item in results:
+        code = str(item.get('code', '')).strip()
+        name = str(item.get('name', '')).strip()
+        key = code or name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append({'code': code, 'name': name})
+        if len(unique) >= max_results:
+            break
+
+    return unique
+
+
+# ---------- 종목명 & 코드 정밀 매칭 ----------
+def get_code_and_name(query):
+    global krx_df
+    query = str(query or '').strip()
+
+    if query.isdigit() and len(query) == 6:
+        results = search_stock_list(query, max_results=1)
+        if results:
+            return results[0]['code'], results[0]['name']
+
+        code = query
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            name_elem = soup.select_one('.wrap_company h2 a')
+            if name_elem:
+                return code, name_elem.text.strip()
+        except Exception:
+            pass
+        return code, code
+
+    results = search_stock_list(query, max_results=1)
+    if results:
+        return results[0]['code'], results[0]['name']
+
+    return None, None
 
 
 # ---------- 네이버 월봉 가격 데이터 스크래핑 ----------
 def _get_naver_monthly_price(code):
+    """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
     url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
@@ -108,16 +283,20 @@ def _get_naver_monthly_price(code):
 
 # ---------- 가격 데이터 다중 소스 폴백 ----------
 def get_price_data(code, name, start_date):
-    # 1) FinanceDataReader
+    """
+    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
+    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
+    """
+    # 1) FinanceDataReader (Yahoo)
     try:
         df = fdr.DataReader(code, start=start_date)
         if df is not None and not df.empty:
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"FinanceDataReader failed: {e}")
 
-    # 2) yfinance
+    # 2) yfinance 직접 호출
     for suffix in ['.KS', '.KQ']:
         try:
             ticker = f"{code}{suffix}"
@@ -127,10 +306,10 @@ def get_price_data(code, name, start_date):
                 df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
                 df.index = df.index.tz_localize(None)
                 return df
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"yfinance failed for {ticker}: {e}")
 
-    # 3) 네이버 월봉
+    # 3) 네이버 금융 월봉 데이터
     df_naver = _get_naver_monthly_price(code)
     if not df_naver.empty:
         cutoff = datetime.today() - timedelta(days=365 * 11)
@@ -327,22 +506,40 @@ def get_pure_real_fundamentals(code, name, df_price_full):
         q_growth_yoy.append(yoy)
 
     fin_payload["quarterly"] = {
-        "labels": q_labels, "profit": q_prof, "revenue": q_rev, "net": q_net,
-        "opm": q_opm, "prices": q_prices, "growth_yoy": q_growth_yoy
+        "labels": q_labels,
+        "profit": q_prof,
+        "revenue": q_rev,
+        "net": q_net,
+        "opm": q_opm,
+        "prices": q_prices,
+        "growth_yoy": q_growth_yoy
     }
     fin_payload["semiannual"] = {
-        "labels": q_labels[::2], "profit": q_prof[::2], "revenue": q_rev[::2], "net": q_net[::2],
-        "opm": q_opm[::2], "prices": q_prices[::2], "growth_yoy": q_growth_yoy[::2]
+        "labels": q_labels[::2],
+        "profit": q_prof[::2],
+        "revenue": q_rev[::2],
+        "net": q_net[::2],
+        "opm": q_opm[::2],
+        "prices": q_prices[::2],
+        "growth_yoy": q_growth_yoy[::2]
     }
     fin_payload["annual"] = {
-        "labels": [l[:4] + "년" for l in q_labels[::4]], "profit": q_prof[::4], "revenue": q_rev[::4],
-        "net": q_net[::4], "opm": q_opm[::4], "prices": q_prices[::4], "growth_yoy": q_growth_yoy[::4]
+        "labels": [l[:4] + "년" for l in q_labels[::4]],
+        "profit": q_prof[::4],
+        "revenue": q_rev[::4],
+        "net": q_net[::4],
+        "opm": q_opm[::4],
+        "prices": q_prices[::4],
+        "growth_yoy": q_growth_yoy[::4]
     }
 
     recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
     fin_payload["growth_model"] = {
-        "est_per": 15.0, "growth_rate": recent_yoy, "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)
+        "est_per": 15.0,
+        "growth_rate": recent_yoy,
+        "peg": 1.0,
+        "target_peg_05": int(cur_price * 0.8),
+        "target_peg_10": int(cur_price * 1.05)
     }
     return fin_payload
 
@@ -422,8 +619,13 @@ def calculate_multi_period_engine(code, name):
         floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
         gap = ((latest_price - floor_price) / floor_price) * 100
         matrix_table.append({
-            "key": key, "period": label, "allocation": alloc, "max_yield": p_max_yield,
-            "floor_price": floor_price, "gap": gap, "diff_won": latest_price - floor_price,
+            "key": key,
+            "period": label,
+            "allocation": alloc,
+            "max_yield": p_max_yield,
+            "floor_price": floor_price,
+            "gap": gap,
+            "diff_won": latest_price - floor_price,
             "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
             "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
         })
@@ -455,23 +657,32 @@ def calculate_multi_period_engine(code, name):
     }
 
     return {
-        "code": code, "name": name, "latest_price": latest_price, "change_pct": change_pct,
-        "current_yield": current_yield, "current_dps": real_dps, "matrix": matrix_table,
-        "buy_step_1": buy_step_1, "buy_step_2": buy_step_2, "buy_step_3": buy_step_3,
-        "div_1y": div_1y, "div_5y": div_5y, "peg_fair": peg_fair, "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100), "w_growth": int(w_growth * 100), "profile_desc": profile_desc,
-        "fin_data": fin_data, "chart_payload": chart_payload
+        "code": code,
+        "name": name,
+        "latest_price": latest_price,
+        "change_pct": change_pct,
+        "current_yield": current_yield,
+        "current_dps": real_dps,
+        "matrix": matrix_table,
+        "buy_step_1": buy_step_1,
+        "buy_step_2": buy_step_2,
+        "buy_step_3": buy_step_3,
+        "div_1y": div_1y,
+        "div_5y": div_5y,
+        "peg_fair": peg_fair,
+        "peg_bottom": peg_bottom,
+        "w_div": int(w_div * 100),
+        "w_growth": int(w_growth * 100),
+        "profile_desc": profile_desc,
+        "fin_data": fin_data,
+        "chart_payload": chart_payload
     }
 
 
 # ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
     if code is None or name is None:
-        # query가 튜플이면 code, name 분리
-        if isinstance(query, tuple):
-            code, name = query
-        else:
-            return None
+        code, name = get_code_and_name(query)
     if not code:
         return None
 
@@ -495,6 +706,45 @@ def generate_v39_dashboard(query, code=None, name=None):
     w_growth = data['w_growth']
     profile_desc = data['profile_desc']
 
+    # IMPORTANT: 중첩 f-string + JavaScript 중괄호로 인한 SyntaxError 방지
+    matrix_rows = "".join(
+        f"""
+        <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
+            <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
+            <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
+            <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
+            <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
+            <td class="py-2.5 px-2.5 {('text-red-400 font-bold' if m['gap'] <= 0 else ('text-amber-400' if m['gap'] <= 3 else 'text-slate-300'))}">
+                {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
+            </td>
+            <td class="py-2.5 px-2.5 text-center">
+                <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
+            </td>
+        </tr>
+        """
+        for m in data['matrix']
+    )
+
+    news_html = "".join(
+        f"""
+        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+            <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
+        </a>
+        """
+        for n in news_items
+    ) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'
+
+    notice_html = "".join(
+        f"""
+        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+            <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
+        </a>
+        """
+        for n in notice_items
+    ) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'
+
     html_content = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -513,6 +763,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 </head>
 <body class="p-3 md:p-6 custom-scroll">
     <div class="max-w-6xl mx-auto space-y-4">
+        
         <!-- 상단 헤더 -->
         <div class="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-2xl backdrop-blur-md flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
@@ -536,7 +787,7 @@ def generate_v39_dashboard(query, code=None, name=None):
             </div>
         </div>
 
-        <!-- 마스터 매매 결론 -->
+        <!-- [최상단 배치] 종목 맞춤형 동적 가중치 3단계 매수 전략 마스터 결론 카드 -->
         <div class="p-5 rounded-2xl border shadow-2xl bg-gradient-to-r from-slate-900 via-indigo-950/80 to-slate-900 border-indigo-500/50 space-y-3">
             <div class="flex items-center justify-between border-b border-slate-800 pb-2">
                 <div class="flex items-center gap-2">
@@ -576,8 +827,10 @@ def generate_v39_dashboard(query, code=None, name=None):
 
         <!-- 메인 레이아웃 -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            
             <div class="lg:col-span-2 space-y-4">
-                <!-- 배당 뷰 -->
+                
+                <!-- [VIEW 1] 배당 가치 분석 뷰 -->
                 <div id="sectionDividendView" class="space-y-4">
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-blue-500/40 space-y-1">
                         <p class="text-xs text-blue-400 font-bold">💰 배당 성장 기반 단독 매수 전략 (실시간 자동 DPS 반영)</p>
@@ -605,21 +858,8 @@ def generate_v39_dashboard(query, code=None, name=None):
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800/60 font-medium cursor-pointer">
-                                    {"".join([f'''
-                                    <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
-                                        <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
-                                        <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
-                                        <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
-                                        <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
-                                        <td class="py-2.5 px-2.5 {'text-red-400 font-bold' if m['gap']<=0 else ('text-amber-400' if m['gap']<=3 else 'text-slate-300')}">
-                                            {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
-                                        </td>
-                                        <td class="py-2.5 px-2.5 text-center">
-                                            <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
-                                        </td>
-                                    </tr>
-                                    ''' for m in data['matrix']])}
-                                </tbody>
+                                    {matrix_rows}
+                    </tbody>
                             </table>
                         </div>
                     </div>
@@ -659,7 +899,7 @@ def generate_v39_dashboard(query, code=None, name=None):
                     </div>
                 </div>
 
-                <!-- 실적 성장 뷰 -->
+                <!-- [VIEW 2] 실적 성장 분석 뷰 -->
                 <div id="sectionGrowthView" class="space-y-4 hidden">
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-emerald-500/40 space-y-1">
                         <p class="text-xs text-emerald-400 font-bold">🚀 실적 성장(PEG) 기반 단독 매수 전략 (실데이터 연동)</p>
@@ -735,6 +975,7 @@ def generate_v39_dashboard(query, code=None, name=None):
                         <div class="relative h-[360px] w-full"><canvas id="growthChart"></canvas></div>
                     </div>
                 </div>
+
             </div>
 
             <!-- 우측 뉴스/공시 -->
@@ -744,23 +985,15 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <button id="tabNoticeBtn" onclick="switchTab('notice')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition">📑 공시</button>
                 </div>
                 <div id="feedNews" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
+                    {news_html}
                 </div>
                 <div id="feedNotice" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll hidden">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
+                    {notice_html}
                 </div>
             </div>
+
         </div>
+
     </div>
 
     <script>
@@ -1014,7 +1247,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.7 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.4 대시보드 렌더링 완료!")
     return html_content
 
 
@@ -1022,70 +1255,100 @@ def generate_v39_dashboard(query, code=None, name=None):
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-st.markdown("종목명 또는 코드를 입력하세요. **CSV 파일을 업로드하면 모든 종목 검색이 가능하며, 없으면 내장된 주요 종목만 검색됩니다.**")
+st.markdown(
+    "종목명, 일부 단어 또는 종목코드를 검색하세요. "
+    "**검색어가 종목명에 포함된 모든 종목을 찾아 선택할 수 있습니다.**"
+)
 
-user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스, 부동산, 맥쿼리)", value="")
+user_query = st.text_input(
+    "🔎 종목 검색",
+    value="",
+    placeholder="예: 부동산 / 리츠 / 하이닉스 / 삼성 / 005930"
+).strip()
 
 if user_query:
-    user_query = user_query.strip()
     selected_code = None
     selected_name = None
 
-    # 1) 6자리 숫자 코드 입력
+    # 1) 6자리 종목코드
     if user_query.isdigit() and len(user_query) == 6:
-        selected_code = user_query
-        # 종목명은 주식 리스트에서 찾기
-        stock_list_df = get_stock_list()
-        match = stock_list_df[stock_list_df['Code'] == selected_code]
-        if not match.empty:
-            selected_name = match.iloc[0]['Name']
+        results = search_stock_list(user_query, max_results=10)
+        if results:
+            if len(results) == 1:
+                selected_code = results[0]['code']
+                selected_name = results[0]['name']
+            else:
+                options = [f"{x['name']} ({x['code']})" for x in results]
+                selected_option = st.selectbox("분석할 종목을 선택하세요", options, key="stock_selector")
+                idx = options.index(selected_option)
+                selected_code = results[idx]['code']
+                selected_name = results[idx]['name']
         else:
-            # 네이버에서 이름 가져오기 시도
+            # 코드가 KRX 목록에 없더라도 네이버에서 종목명을 확인
+            selected_code = user_query
             try:
                 url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
                 res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
                 soup = BeautifulSoup(res.text, 'html.parser')
                 name_elem = soup.select_one('.wrap_company h2 a')
-                if name_elem:
-                    selected_name = name_elem.text.strip()
+                selected_name = name_elem.text.strip() if name_elem else None
             except Exception:
-                pass
-            if selected_name is None:
-                selected_name = selected_code
+                selected_name = None
 
-    # 2) 종목명 또는 부분 검색어
+            if not selected_name:
+                st.error("해당 종목코드를 찾지 못했습니다. 코드를 확인해주세요.")
+
+    # 2) 종목명/부분 검색
     else:
-        stock_list_df = get_stock_list()
-        if not stock_list_df.empty:
-            matches = stock_list_df[stock_list_df['Name'].str.contains(user_query, case=False, na=False)]
-            if len(matches) == 0:
-                st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
-            elif len(matches) == 1:
-                selected_code = matches.iloc[0]['Code']
-                selected_name = matches.iloc[0]['Name']
-            else:
-                st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(matches)}개)")
-                options = [f"{row['Name']} ({row['Code']})" for _, row in matches.iterrows()]
-                selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
-                if selected_option:
-                    code_part = selected_option.split('(')[-1].rstrip(')')
-                    selected_code = code_part
-                    selected_name = selected_option.split(' (')[0]
-        else:
-            st.error("종목 리스트를 불러올 수 없습니다. 6자리 코드로 직접 입력해주세요.")
+        search_results = search_stock_list(user_query, max_results=200)
 
-    # 3) 분석 실행
+        if not search_results:
+            st.warning(
+                f"'{user_query}'가 종목명에 포함된 종목을 찾지 못했습니다. "
+                "다른 검색어를 입력해보세요."
+            )
+        else:
+            st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
+            st.caption("종목명에 검색어가 포함된 종목을 모두 표시합니다. 아래에서 분석할 종목을 선택하세요.")
+
+            options = [f"{item['name']}  |  {item['code']}" for item in search_results]
+            selected_option = st.selectbox(
+                "📌 분석할 종목 선택",
+                options,
+                key=f"stock_selector_{user_query}"
+            )
+
+            if selected_option:
+                selected_idx = options.index(selected_option)
+                selected_code = search_results[selected_idx]['code']
+                selected_name = search_results[selected_idx]['name']
+
+            # 검색 결과를 간단한 표로도 보여줘 선택 대상을 확인하기 쉽게 함
+            result_table = pd.DataFrame(search_results)
+            result_table.columns = ['종목코드', '종목명']
+            st.dataframe(
+                result_table,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 35 * len(result_table) + 45)
+            )
+
+    # 3) 선택한 종목 분석
     if selected_code and selected_name:
-        with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
-            try:
-                html_str = generate_v39_dashboard(
-                    query=user_query,
-                    code=selected_code,
-                    name=selected_name
-                )
-                if html_str:
-                    st.components.v1.html(html_str, height=1200, scrolling=True)
-                else:
-                    st.error("대시보드 생성에 실패했습니다.")
-            except Exception as e:
-                st.error(f"오류가 발생했습니다: {str(e)}")
+        st.info(f"선택 종목: **{selected_name} ({selected_code})**")
+        if st.button("🚀 선택 종목 분석 실행", type="primary", use_container_width=True):
+            with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+                try:
+                    html_str = generate_v39_dashboard(
+                        query=user_query,
+                        code=selected_code,
+                        name=selected_name
+                    )
+                    if html_str:
+                        st.components.v1.html(html_str, height=1200, scrolling=True)
+                    else:
+                        st.error("대시보드 생성에 실패했습니다.")
+                except Exception as e:
+                    logging.exception("대시보드 생성 오류")
+                    st.error(f"오류가 발생했습니다: {str(e)}")
+

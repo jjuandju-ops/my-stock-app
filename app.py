@@ -1,5 +1,5 @@
 # ============================================================
-# [v39.0] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+# [v39.1] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
 # ============================================================
 
 import os
@@ -40,8 +40,10 @@ def get_code_and_name(query):
         return code, code
 
     if krx_df is None:
-        try: krx_df = fdr.StockListing('KRX')
-        except Exception: krx_df = pd.DataFrame()
+        try:
+            krx_df = fdr.StockListing('KRX')
+        except Exception:
+            krx_df = pd.DataFrame()
 
     if not krx_df.empty:
         exact = krx_df[krx_df['Name'] == query]
@@ -63,7 +65,8 @@ def get_dps_automatically(code, name):
                 recent_divs = divs[divs.index >= (datetime.today() - timedelta(days=365))]
                 if not recent_divs.empty:
                     dps_val = float(recent_divs.sum())
-                    if dps_val > 0: return dps_val
+                    if dps_val > 0:
+                        return dps_val
         except Exception:
             continue
 
@@ -78,11 +81,13 @@ def get_dps_automatically(code, name):
                     nums = re.findall(r'[\d,]+', nxt.text)
                     if nums:
                         val = float(nums[0].replace(',', ''))
-                        if val > 10: return val
+                        if val > 10:
+                            return val
     except Exception:
         pass
 
-    if '리츠' in name or '맥쿼리' in name: return 730.0
+    if '리츠' in name or '맥쿼리' in name:
+        return 730.0
     return 350.0
 
 # 4. 뉴스 및 공시 크롤링
@@ -100,7 +105,8 @@ def get_news_and_disclosures(code):
         soup = BeautifulSoup(res.text, 'html.parser')
         for tr in soup.find_all('tr'):
             a = tr.select_one('td.title a')
-            if not a: continue
+            if not a:
+                continue
             title = a.text.strip()
             href = a.get('href', '')
             link = f"https://finance.naver.com{href}" if href.startswith('/') else href
@@ -110,7 +116,8 @@ def get_news_and_disclosures(code):
             date_str = date_td.text.strip()[:10] if date_td else ""
             tag = "배당" if any(k in title for k in ['배당', '분배', '주주']) else ("실적" if any(k in title for k in ['실적', '영업', '매출', '순익']) else "뉴스")
             news_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(news_list) >= 10: break
+            if len(news_list) >= 10:
+                break
     except Exception:
         pass
 
@@ -121,7 +128,8 @@ def get_news_and_disclosures(code):
         soup = BeautifulSoup(res.text, 'html.parser')
         for tr in soup.find_all('tr'):
             a = tr.select_one('td.title a')
-            if not a: continue
+            if not a:
+                continue
             title = a.text.strip()
             href = a.get('href', '')
             link = f"https://finance.naver.com{href}" if href.startswith('/') else href
@@ -131,7 +139,8 @@ def get_news_and_disclosures(code):
             date_str = date_td.text.strip()[:10] if date_td else ""
             tag = "배당공시" if any(k in title for k in ['배당', '분배', '주주총회']) else ("실적공시" if any(k in title for k in ['실적', '매출', '영업', '보고서']) else "공시")
             notice_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(notice_list) >= 10: break
+            if len(notice_list) >= 10:
+                break
     except Exception:
         pass
 
@@ -150,7 +159,8 @@ def get_pure_real_fundamentals(code, name, df_price_full):
         "growth_model": {"est_per": 15.0, "growth_rate": 10.0, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
     }
     
-    if is_etf: return fin_payload
+    if is_etf:
+        return fin_payload
 
     def get_closest_price(date_str):
         try:
@@ -158,7 +168,8 @@ def get_pure_real_fundamentals(code, name, df_price_full):
             parts = clean_d.split('.')
             target_dt = pd.to_datetime(f"{parts[0]}-{int(parts[1]):02d}-28") if len(parts) == 2 else pd.to_datetime(clean_d)
             sub = df_price_full[df_price_full.index <= target_dt]
-            if not sub.empty: return int(sub['Close'].iloc[-1])
+            if not sub.empty:
+                return int(sub['Close'].iloc[-1])
             return int(df_price_full['Close'].iloc[-1])
         except Exception:
             return int(df_price_full['Close'].iloc[-1])
@@ -175,8 +186,10 @@ def get_pure_real_fundamentals(code, name, df_price_full):
                     prof = float(q_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in q_inc.index and pd.notna(q_inc.loc['Operating Income', col]) else 0.0
                     net_m = [idx for idx in q_inc.index if 'Net Income' in str(idx)]
                     net = float(q_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(q_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0: q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
-            if q_dict: break
+                    if rev > 0 or prof != 0:
+                        q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
+            if q_dict:
+                break
     except Exception:
         pass
 
@@ -200,7 +213,8 @@ def get_pure_real_fundamentals(code, name, df_price_full):
                         n_rev, n_prof, n_net = parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')
                         for l, r, p, n in zip(n_lbls, n_rev, n_prof, n_net):
                             clean_l = l.replace('(E)', '').strip()
-                            if r > 0 or p != 0: q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
+                            if r > 0 or p != 0:
+                                q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
                     break
         except Exception:
             pass
@@ -212,49 +226,76 @@ def get_pure_real_fundamentals(code, name, df_price_full):
     q_labels, q_rev, q_prof, q_net, q_opm, q_prices, q_growth_yoy = [], [], [], [], [], [], []
     for idx, k in enumerate(sorted_q):
         r, p, n = q_dict[k]["revenue"], q_dict[k]["profit"], q_dict[k]["net"]
-        q_labels.append(k); q_rev.append(r); q_prof.append(p); q_net.append(n)
+        q_labels.append(k)
+        q_rev.append(r)
+        q_prof.append(p)
+        q_net.append(n)
         q_opm.append(round((p / r * 100), 1) if r > 0 else 0.0)
         q_prices.append(get_closest_price(k))
         if idx >= 4:
             prev_p = q_dict[sorted_q[idx-4]]["profit"]
             yoy = round(((p - prev_p) / abs(prev_p) * 100), 1) if prev_p != 0 else 0.0
-        else: yoy = 10.0
+        else:
+            yoy = 10.0
         q_growth_yoy.append(yoy)
 
-    fin_payload["quarterly"] = {"labels": q_labels, "profit": q_prof, "revenue": q_rev, "net": q_net, "opm": q_opm, "prices": q_prices, "growth_yoy": q_growth_yoy}
-    fin_payload["semiannual"] = {"labels": q_labels[::2], "profit": q_prof[::2], "revenue": q_rev[::2], "net": q_net[::2], "opm": q_opm[::2], "prices": q_prices[::2], "growth_yoy": q_growth_yoy[::2]}
-    fin_payload["annual"] = {"labels": [l[:4]+"년" for l in q_labels[::4]], "profit": q_prof[::4], "revenue": q_rev[::4], "net": q_net[::4], "opm": q_opm[::4], "prices": q_prices[::4], "growth_yoy": q_growth_yoy[::4]}
+    fin_payload["quarterly"] = {
+        "labels": q_labels,
+        "profit": q_prof,
+        "revenue": q_rev,
+        "net": q_net,
+        "opm": q_opm,
+        "prices": q_prices,
+        "growth_yoy": q_growth_yoy
+    }
+    fin_payload["semiannual"] = {
+        "labels": q_labels[::2],
+        "profit": q_prof[::2],
+        "revenue": q_rev[::2],
+        "net": q_net[::2],
+        "opm": q_opm[::2],
+        "prices": q_prices[::2],
+        "growth_yoy": q_growth_yoy[::2]
+    }
+    fin_payload["annual"] = {
+        "labels": [l[:4] + "년" for l in q_labels[::4]],
+        "profit": q_prof[::4],
+        "revenue": q_rev[::4],
+        "net": q_net[::4],
+        "opm": q_opm[::4],
+        "prices": q_prices[::4],
+        "growth_yoy": q_growth_yoy[::4]
+    }
 
     recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
     fin_payload["growth_model"] = {
-        "est_per": 15.0, "growth_rate": recent_yoy, "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)
+        "est_per": 15.0,
+        "growth_rate": recent_yoy,
+        "peg": 1.0,
+        "target_peg_05": int(cur_price * 0.8),
+        "target_peg_10": int(cur_price * 1.05)
     }
     return fin_payload
 
 # 6. [신규] 종목 특성별 동적 가중치(Dynamic Weighting) 산출 엔진
 def calculate_dynamic_weights(current_yield, growth_rate):
     """
-    종목의 배당수익률과 영업이익 성장률(YoY)을 기반으로 
+    종목의 배당수익률과 영업이익 성장률(YoY)을 기반으로
     배당 가치 모델과 실적 성장(PEG) 모델의 최적 가중치를 동적으로 결정합니다.
     """
-    # 기본 가중치 (균형형 50:50)
     w_div = 0.5
     w_growth = 0.5
     profile_desc = "균형 성장/배당 믹스형"
 
     if current_yield >= 5.0 and growth_rate < 10.0:
-        # 고배당 안정형 (예: 금융, 통신, 리츠) -> 배당 가중치 대폭 상향
         w_div = 0.8
         w_growth = 0.2
         profile_desc = "고배당 안정형 체질"
     elif current_yield < 1.5 and growth_rate >= 20.0:
-        # 고성장 무/저배당형 (예: IT, 바이오, 성장주) -> 실적 성장 가중치 대폭 상향
         w_div = 0.2
         w_growth = 0.8
         profile_desc = "고성장 모멘텀형 체질"
     elif current_yield >= 3.0 and growth_rate >= 15.0:
-        # 배당성장 복합형 (우수 우량주)
         w_div = 0.4
         w_growth = 0.6
         profile_desc = "배당성장 복합 체질"
@@ -266,7 +307,8 @@ def calculate_multi_period_engine(code, name):
     now = datetime.today()
     start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
     df = fdr.DataReader(code, start=start_date)
-    if df.empty: return None
+    if df.empty:
+        return None
         
     latest_price = int(df['Close'].iloc[-1])
     prev_price = int(df['Close'].iloc[-2])
@@ -303,13 +345,19 @@ def calculate_multi_period_engine(code, name):
     period_stats = {}
     for key, (label, yr, alloc) in periods_def.items():
         sub_df = df_all[df_all.index >= now - timedelta(days=365 * yr)]
-        if sub_df.empty: sub_df = df_all
+        if sub_df.empty:
+            sub_df = df_all
         p_max_yield = float(np.max(sub_df['Yield'])) if not sub_df.empty else 3.67
         floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
         gap = ((latest_price - floor_price) / floor_price) * 100
         matrix_table.append({
-            "key": key, "period": label, "allocation": alloc, "max_yield": p_max_yield,
-            "floor_price": floor_price, "gap": gap, "diff_won": latest_price - floor_price,
+            "key": key,
+            "period": label,
+            "allocation": alloc,
+            "max_yield": p_max_yield,
+            "floor_price": floor_price,
+            "gap": gap,
+            "diff_won": latest_price - floor_price,
             "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
             "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
         })
@@ -325,7 +373,7 @@ def calculate_multi_period_engine(code, name):
     peg_bottom = gm['target_peg_05']
     growth_rate = gm['growth_rate']
 
-    # 종목별 맞춤형 동적 가중치 산출 (백테스트 철학 반영)
+    # 종목별 맞춤형 동적 가중치 산출
     w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
 
     # 동적 가중치를 적용한 3단계 융합 매수가 계산
@@ -343,20 +391,35 @@ def calculate_multi_period_engine(code, name):
     }
 
     return {
-        "code": code, "name": name, "latest_price": latest_price, "change_pct": change_pct,
-        "current_yield": current_yield, "current_dps": real_dps, "matrix": matrix_table,
-        "buy_step_1": buy_step_1, "buy_step_2": buy_step_2, "buy_step_3": buy_step_3,
-        "div_1y": div_1y, "div_5y": div_5y, "peg_fair": peg_fair, "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100), "w_growth": int(w_growth * 100), "profile_desc": profile_desc,
-        "fin_data": fin_data, "chart_payload": chart_payload
+        "code": code,
+        "name": name,
+        "latest_price": latest_price,
+        "change_pct": change_pct,
+        "current_yield": current_yield,
+        "current_dps": real_dps,
+        "matrix": matrix_table,
+        "buy_step_1": buy_step_1,
+        "buy_step_2": buy_step_2,
+        "buy_step_3": buy_step_3,
+        "div_1y": div_1y,
+        "div_5y": div_5y,
+        "peg_fair": peg_fair,
+        "peg_bottom": peg_bottom,
+        "w_div": int(w_div * 100),
+        "w_growth": int(w_growth * 100),
+        "profile_desc": profile_desc,
+        "fin_data": fin_data,
+        "chart_payload": chart_payload
     }
 
-# 8. GUI 렌더링 함수
+# 8. GUI 렌더링 함수 (HTML 문자열 반환)
 def generate_v39_dashboard(query):
     code, name = get_code_and_name(query)
-    if not code: return
+    if not code:
+        return None
     data = calculate_multi_period_engine(code, name)
-    if not data: return
+    if not data:
+        return None
 
     news_items, notice_items = get_news_and_disclosures(code)
     fin = data['fin_data']
@@ -753,8 +816,15 @@ def generate_v39_dashboard(query):
             }});
             document.getElementById('hudFloorLabel').innerText = (key === '1Y' ? '1년' : (key === '3Y' ? '3년' : (key === '5Y' ? '5년' : '10년')));
             sliceDataForPeriod(key);
-            mainChart.data.labels = activeDates; mainChart.data.datasets[0].data = activeSnipers; mainChart.data.datasets[1].data = activePrices; mainChart.data.datasets[2].data = activeYields; mainChart.data.datasets[3].data = activeFloors; mainChart.update();
-            rsiChart.data.labels = activeDates; rsiChart.data.datasets[0].data = activeRsis; rsiChart.update();
+            mainChart.data.labels = activeDates;
+            mainChart.data.datasets[0].data = activeSnipers;
+            mainChart.data.datasets[1].data = activePrices;
+            mainChart.data.datasets[2].data = activeYields;
+            mainChart.data.datasets[3].data = activeFloors;
+            mainChart.update();
+            rsiChart.data.labels = activeDates;
+            rsiChart.data.datasets[0].data = activeRsis;
+            rsiChart.update();
             updateHud(activeDates.length - 1);
         }}
 
@@ -892,15 +962,19 @@ def generate_v39_dashboard(query):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.0 대시보드 렌더링 완료!")
-    display(HTML(html_content))
+    print(f"✅ [{data['name']}] v39.1 대시보드 렌더링 완료!")
+    return html_content  # HTML 문자열 반환
 
-# 8. Streamlit 웹 화면 실행부
+# 9. Streamlit 웹 화면 실행부
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
+st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
 user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="178920")
 
 if user_query:
     with st.spinner('데이터를 수집하고 대시보드를 생성하는 중입니다...'):
-        # 기존 렌더링 함수 안에서 display(HTML(html_content)) 대신 
-        # HTML 문자열을 리턴받거나 아래와 같이 처리되도록 수정해야 합니다.
+        html_str = generate_v39_dashboard(user_query)
+        if html_str:
+            st.components.v1.html(html_str, height=1200, scrolling=True)
+        else:
+            st.error("데이터를 가져오지 못했습니다. 종목명 또는 코드를 확인해주세요.")

@@ -1,6 +1,6 @@
 # ============================================================
-# [v39.8] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 외부 API 차단 대응: 주요 종목 200개 내장 (CSV 불필요)
+# [v39.4] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 네이버 자동완성 API를 활용한 종목 검색 리스트
 #         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
 
@@ -21,551 +21,282 @@ import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-# ---------- 내장 종목 리스트 (코스피/코스닥 주요 200개) ----------
-EMBEDDED_STOCK_LIST = pd.DataFrame([
-    {"Code": "005930", "Name": "삼성전자"},
-    {"Code": "000660", "Name": "SK하이닉스"},
-    {"Code": "035420", "Name": "NAVER"},
-    {"Code": "035720", "Name": "카카오"},
-    {"Code": "005380", "Name": "현대차"},
-    {"Code": "000270", "Name": "기아"},
-    {"Code": "105560", "Name": "KB금융"},
-    {"Code": "055550", "Name": "신한지주"},
-    {"Code": "086790", "Name": "하나금융지주"},
-    {"Code": "032830", "Name": "삼성생명"},
-    {"Code": "051910", "Name": "LG화학"},
-    {"Code": "006400", "Name": "삼성SDI"},
-    {"Code": "005490", "Name": "POSCO홀딩스"},
-    {"Code": "373220", "Name": "LG에너지솔루션"},
-    {"Code": "017670", "Name": "SK텔레콤"},
-    {"Code": "030200", "Name": "KT"},
-    {"Code": "032640", "Name": "LG유플러스"},
-    {"Code": "009150", "Name": "삼성전기"},
-    {"Code": "066570", "Name": "LG전자"},
-    {"Code": "000810", "Name": "삼성화재"},
-    {"Code": "024110", "Name": "기업은행"},
-    {"Code": "316140", "Name": "우리금융지주"},
-    {"Code": "139480", "Name": "이마트"},
-    {"Code": "023530", "Name": "롯데쇼핑"},
-    {"Code": "035250", "Name": "강원랜드"},
-    {"Code": "011170", "Name": "호텔신라"},
-    {"Code": "010130", "Name": "고려아연"},
-    {"Code": "011070", "Name": "LG이노텍"},
-    {"Code": "018260", "Name": "삼성에스디에스"},
-    {"Code": "028260", "Name": "삼성물산"},
-    {"Code": "000720", "Name": "현대건설"},
-    {"Code": "006360", "Name": "GS건설"},
-    {"Code": "047040", "Name": "대우건설"},
-    {"Code": "002990", "Name": "금호건설"},
-    {"Code": "003960", "Name": "사조대림"},
-    {"Code": "004990", "Name": "롯데지주"},
-    {"Code": "009540", "Name": "한국조선해양"},
-    {"Code": "010140", "Name": "삼성중공업"},
-    {"Code": "042660", "Name": "대우조선해양"},
-    {"Code": "010950", "Name": "S-Oil"},
-    {"Code": "096770", "Name": "SK이노베이션"},
-    {"Code": "003670", "Name": "포스코케미칼"},
-    {"Code": "010060", "Name": "OCI"},
-    {"Code": "011780", "Name": "금호석유화학"},
-    {"Code": "012450", "Name": "한화에어로스페이스"},
-    {"Code": "015760", "Name": "한국전력"},
-    {"Code": "017040", "Name": "광명전기"},
-    {"Code": "034020", "Name": "두산중공업"},
-    {"Code": "042700", "Name": "한미반도체"},
-    {"Code": "058470", "Name": "리노공업"},
-    {"Code": "066970", "Name": "엘앤에프"},
-    {"Code": "078600", "Name": "대주전자재료"},
-    {"Code": "083650", "Name": "비에이치"},
-    {"Code": "089030", "Name": "테크윙"},
-    {"Code": "095340", "Name": "ISC"},
-    {"Code": "102120", "Name": "어보브반도체"},
-    {"Code": "112040", "Name": "위메이드"},
-    {"Code": "251270", "Name": "넷마블"},
-    {"Code": "263750", "Name": "펄어비스"},
-    {"Code": "036570", "Name": "엔씨소프트"},
-    {"Code": "041510", "Name": "에스엠"},
-    {"Code": "035900", "Name": "JYP Ent."},
-    {"Code": "078340", "Name": "컴투스"},
-    {"Code": "017890", "Name": "한국알콜"},
-    {"Code": "069080", "Name": "웹젠"},
-    {"Code": "035600", "Name": "KG이니시스"},
-    {"Code": "053800", "Name": "안랩"},
-    {"Code": "060250", "Name": "NHN KCP"},
-    {"Code": "214370", "Name": "케어젠"},
-    {"Code": "263050", "Name": "유틸렉스"},
-    {"Code": "067160", "Name": "아프리카TV"},
-    {"Code": "063570", "Name": "한국전자금융"},
-    {"Code": "021080", "Name": "에이티넘인베스트"},
-    {"Code": "027360", "Name": "아주IB투자"},
-    {"Code": "039030", "Name": "이오테크닉스"},
-    {"Code": "052460", "Name": "아이크래프트"},
-    {"Code": "075970", "Name": "동국산업"},
-    {"Code": "089890", "Name": "코세스"},
-    {"Code": "095610", "Name": "테스"},
-    {"Code": "108230", "Name": "톱텍"},
-    {"Code": "122870", "Name": "와이지엔터테인먼트"},
-    {"Code": "137400", "Name": "피엔티"},
-    {"Code": "143210", "Name": "핸즈코퍼레이션"},
-    {"Code": "148150", "Name": "세경하이테크"},
-    {"Code": "153460", "Name": "네이블"},
-    {"Code": "161580", "Name": "필옵틱스"},
-    {"Code": "178320", "Name": "서진시스템"},
-    {"Code": "183300", "Name": "코미코"},
-    {"Code": "196170", "Name": "알테오젠"},
-    {"Code": "208140", "Name": "정다운"},
-    {"Code": "214150", "Name": "클래시스"},
-    {"Code": "217190", "Name": "제노스코"},
-    {"Code": "222080", "Name": "씨아이에스"},
-    {"Code": "226340", "Name": "본느"},
-    {"Code": "228760", "Name": "지노믹트리"},
-    {"Code": "237880", "Name": "클리오"},
-    {"Code": "243070", "Name": "휴온스"},
-    {"Code": "246250", "Name": "에스엠비나"},
-    {"Code": "263720", "Name": "디앤씨미디어"},
-    {"Code": "267260", "Name": "HD현대일렉트릭"},
-    {"Code": "272210", "Name": "한화시스템"},
-    {"Code": "282330", "Name": "BGF리테일"},
-    {"Code": "291230", "Name": "한국제지"},
-    {"Code": "298020", "Name": "효성티앤씨"},
-    {"Code": "302440", "Name": "SK바이오사이언스"},
-    {"Code": "304100", "Name": "솔트룩스"},
-    {"Code": "310200", "Name": "애니플러스"},
-    {"Code": "317870", "Name": "엠에스오토텍"},
-    {"Code": "322310", "Name": "오로스테크놀로지"},
-    {"Code": "326030", "Name": "SK바이오팜"},
-    {"Code": "335890", "Name": "비올"},
-    {"Code": "341310", "Name": "이노시스"},
-    {"Code": "347860", "Name": "알체라"},
-    {"Code": "348210", "Name": "넥스틴"},
-    {"Code": "352820", "Name": "하이브"},
-    {"Code": "357780", "Name": "솔브레인"},
-    {"Code": "361610", "Name": "SK아이이테크놀로지"},
-    {"Code": "363250", "Name": "진시스템"},
-    {"Code": "365340", "Name": "성일하이텍"},
-    {"Code": "372800", "Name": "아이티아이즈"},
-    {"Code": "377300", "Name": "카카오페이"},
-    {"Code": "383310", "Name": "에코프로비엠"},
-    {"Code": "383220", "Name": "F&F"},
-    {"Code": "389500", "Name": "에스엠코어"},
-    {"Code": "396270", "Name": "넥스트칩"},
-    {"Code": "403870", "Name": "SK스퀘어"},
-    {"Code": "405100", "Name": "큐알티"},
-    {"Code": "417500", "Name": "제이오"},
-    {"Code": "420570", "Name": "지투지바이오"},
-    {"Code": "424960", "Name": "한화생명"},
-    {"Code": "432320", "Name": "KB스타리츠"},
-    {"Code": "432330", "Name": "신한알파리츠"},
-    {"Code": "432340", "Name": "이리츠코크렙"},
-    {"Code": "432350", "Name": "케이탑리츠"},
-    {"Code": "432360", "Name": "모두투어리츠"},
-    {"Code": "432370", "Name": "롯데리츠"},
-    {"Code": "432380", "Name": "제이알글로벌리츠"},
-    {"Code": "432390", "Name": "미래에셋글로벌리츠"},
-    {"Code": "432400", "Name": "NH올원리츠"},
-    {"Code": "432410", "Name": "하나자산신탁"},
-    {"Code": "432420", "Name": "한국자산신탁"},
-    {"Code": "432430", "Name": "한국토지신탁"},
-    {"Code": "432440", "Name": "코람코에너지리츠"},
-    {"Code": "432450", "Name": "SK에코플랜트"},
-    {"Code": "432460", "Name": "현대엔지니어링"},
-    {"Code": "432470", "Name": "GS리테일"},
-    {"Code": "432480", "Name": "BGF"},
-    {"Code": "432490", "Name": "E1"},
-    {"Code": "432500", "Name": "삼양식품"},
-    {"Code": "432510", "Name": "농심"},
-    {"Code": "432520", "Name": "오리온"},
-    {"Code": "432530", "Name": "크래프톤"},
-    {"Code": "432540", "Name": "카카오뱅크"},
-    {"Code": "432550", "Name": "케이뱅크"},
-    {"Code": "432560", "Name": "토스"},
-    {"Code": "432570", "Name": "한화손해보험"},
-    {"Code": "432580", "Name": "DB손해보험"},
-    {"Code": "432590", "Name": "현대해상"},
-    {"Code": "432600", "Name": "메리츠화재"},
-    {"Code": "432610", "Name": "롯데손해보험"},
-    {"Code": "432620", "Name": "MG손해보험"},
-    {"Code": "432630", "Name": "흥국화재"},
-    {"Code": "432640", "Name": "한화투자증권"},
-    {"Code": "432650", "Name": "NH투자증권"},
-    {"Code": "432660", "Name": "미래에셋증권"},
-    {"Code": "432670", "Name": "삼성증권"},
-    {"Code": "432680", "Name": "키움증권"},
-    {"Code": "432690", "Name": "대신증권"},
-    {"Code": "432700", "Name": "신영증권"},
-    {"Code": "432710", "Name": "유안타증권"},
-    {"Code": "432720", "Name": "한국금융지주"},
-    {"Code": "432730", "Name": "SK증권"},
-    {"Code": "432740", "Name": "교보증권"},
-    {"Code": "432750", "Name": "하나증권"},
-    {"Code": "432760", "Name": "현대차증권"},
-    {"Code": "432770", "Name": "이베스트투자증권"},
-    {"Code": "432780", "Name": "한화오션"},
-    {"Code": "432790", "Name": "HD현대중공업"},
-    {"Code": "432800", "Name": "삼성중공업"},
-    {"Code": "432810", "Name": "두산에너빌리티"},
-    {"Code": "432820", "Name": "한전KPS"},
-    {"Code": "432830", "Name": "한국가스공사"},
-    {"Code": "432840", "Name": "한국전력기술"},
-    {"Code": "432850", "Name": "두산밥캣"},
-    {"Code": "432860", "Name": "현대글로비스"},
-    {"Code": "432870", "Name": "팬오션"},
-    {"Code": "432880", "Name": "대한항공"},
-    {"Code": "432890", "Name": "아시아나항공"},
-    {"Code": "432900", "Name": "진에어"},
-    {"Code": "432910", "Name": "제주항공"},
-    {"Code": "432920", "Name": "티웨이항공"},
-    {"Code": "432930", "Name": "에어부산"},
-    {"Code": "432940", "Name": "CJ대한통운"},
-    {"Code": "432950", "Name": "한진"},
-    {"Code": "432960", "Name": "현대엘리베이터"},
-    {"Code": "432970", "Name": "오티스엘리베이터"},
-    {"Code": "432980", "Name": "LS ELECTRIC"},
-    {"Code": "432990", "Name": "일진전기"},
-    {"Code": "433000", "Name": "대한전선"},
-    {"Code": "433010", "Name": "가온전선"},
-    {"Code": "433020", "Name": "한국단자공업"},
-    {"Code": "433030", "Name": "유라테크"},
-    {"Code": "433040", "Name": "경신"},
-    {"Code": "433050", "Name": "태양금속"},
-    {"Code": "433060", "Name": "한국프랜지"},
-    {"Code": "433070", "Name": "에스엘"},
-    {"Code": "433080", "Name": "모트렉스"},
-    {"Code": "433090", "Name": "넥센타이어"},
-    {"Code": "433100", "Name": "한국타이어"},
-    {"Code": "433110", "Name": "금호타이어"},
-    {"Code": "433120", "Name": "현대모비스"},
-    {"Code": "433130", "Name": "한온시스템"},
-    {"Code": "433140", "Name": "만도"},
-    {"Code": "433150", "Name": "HL만도"},
-    {"Code": "433160", "Name": "세방전지"},
-    {"Code": "433170", "Name": "아트라스BX"},
-    {"Code": "433180", "Name": "한국자동차부품"},
-    {"Code": "433190", "Name": "화신"},
-    {"Code": "433200", "Name": "성우하이텍"},
-    {"Code": "433210", "Name": "동원금속"},
-    {"Code": "433220", "Name": "동국제강"},
-    {"Code": "433230", "Name": "세아제강"},
-    {"Code": "433240", "Name": "현대제철"},
-    {"Code": "433250", "Name": "고려제강"},
-    {"Code": "433260", "Name": "한국철강"},
-    {"Code": "433270", "Name": "동양철관"},
-    {"Code": "433280", "Name": "하이스틸"},
-    {"Code": "433290", "Name": "넥스틸"},
-    {"Code": "433300", "Name": "문배철강"},
-    {"Code": "433310", "Name": "대동스틸"},
-    {"Code": "433320", "Name": "동국제약"},
-    {"Code": "433330", "Name": "일동제약"},
-    {"Code": "433340", "Name": "유한양행"},
-    {"Code": "433350", "Name": "녹십자"},
-    {"Code": "433360", "Name": "한미약품"},
-    {"Code": "433370", "Name": "대웅제약"},
-    {"Code": "433380", "Name": "종근당"},
-    {"Code": "433390", "Name": "보령제약"},
-    {"Code": "433400", "Name": "동아에스티"},
-    {"Code": "433410", "Name": "셀트리온"},
-    {"Code": "433420", "Name": "삼성바이오로직스"},
-    {"Code": "433430", "Name": "SK바이오사이언스"},
-    {"Code": "433440", "Name": "유바이오로직스"},
-    {"Code": "433450", "Name": "차바이오텍"},
-    {"Code": "433460", "Name": "메지온"},
-    {"Code": "433470", "Name": "휴젤"},
-    {"Code": "433480", "Name": "클래시스"},
-    {"Code": "433490", "Name": "바디텍메드"},
-    {"Code": "433500", "Name": "인바디"},
-    {"Code": "433510", "Name": "씨젠"},
-    {"Code": "433520", "Name": "엑세스바이오"},
-    {"Code": "433530", "Name": "수젠텍"},
-    {"Code": "433540", "Name": "미코"},
-    {"Code": "433550", "Name": "피씨엘"},
-    {"Code": "433560", "Name": "랩지노믹스"},
-    {"Code": "433570", "Name": "엔지켐생명과학"},
-    {"Code": "433580", "Name": "아이큐어"},
-    {"Code": "433590", "Name": "테라젠이텍스"},
-    {"Code": "433600", "Name": "신테카바이오"},
-    {"Code": "433610", "Name": "박셀바이오"},
-    {"Code": "433620", "Name": "올리패스"},
-    {"Code": "433630", "Name": "앱클론"},
-    {"Code": "433640", "Name": "레고켐바이오"},
-    {"Code": "433650", "Name": "에이비엘바이오"},
-    {"Code": "433660", "Name": "오스코텍"},
-    {"Code": "433670", "Name": "네오이뮨텍"},
-    {"Code": "433680", "Name": "제넥신"},
-    {"Code": "433690", "Name": "유틸렉스"},
-    {"Code": "433700", "Name": "안트로젠"},
-    {"Code": "433710", "Name": "강스템바이오텍"},
-    {"Code": "433720", "Name": "코아스템"},
-    {"Code": "433730", "Name": "테고사이언스"},
-    {"Code": "433740", "Name": "제노포커스"},
-    {"Code": "433750", "Name": "바이오톡스텍"},
-    {"Code": "433760", "Name": "노터스"},
-    {"Code": "433770", "Name": "피플바이오"},
-    {"Code": "433780", "Name": "프레스티지바이오로직스"},
-    {"Code": "433790", "Name": "셀리드"},
-    {"Code": "433800", "Name": "이뮨온시아"},
-    {"Code": "433810", "Name": "유틸렉스"},
-    {"Code": "433820", "Name": "에스티큐브"},
-    {"Code": "433830", "Name": "아이엠지티"},
-    {"Code": "433840", "Name": "지니너스"},
-    {"Code": "433850", "Name": "제노레이"},
-    {"Code": "433860", "Name": "디앤디파마텍"},
-    {"Code": "433870", "Name": "셀리버리"},
-    {"Code": "433880", "Name": "파멥신"},
-    {"Code": "433890", "Name": "테라사이언스"},
-    {"Code": "433900", "Name": "엔솔바이오사이언스"},
-    {"Code": "433910", "Name": "셀루메드"},
-    {"Code": "433920", "Name": "바이오솔루션"},
-    {"Code": "433930", "Name": "아이진"},
-    {"Code": "433940", "Name": "큐리언트"},
-    {"Code": "433950", "Name": "유바이오로직스"},
-    {"Code": "433960", "Name": "셀트리온헬스케어"},
-    {"Code": "433970", "Name": "셀트리온제약"},
-    {"Code": "433980", "Name": "삼성바이오에피스"},
-    {"Code": "433990", "Name": "SK바이오팜"},
-    {"Code": "434000", "Name": "HK이노엔"},
-    {"Code": "434010", "Name": "대웅"},
-    {"Code": "434020", "Name": "보령"},
-    {"Code": "434030", "Name": "동아쏘시오홀딩스"},
-    {"Code": "434040", "Name": "GC녹십자홀딩스"},
-    {"Code": "434050", "Name": "한올바이오파마"},
-    {"Code": "434060", "Name": "삼진제약"},
-    {"Code": "434070", "Name": "환인제약"},
-    {"Code": "434080", "Name": "동성제약"},
-    {"Code": "434090", "Name": "명문제약"},
-    {"Code": "434100", "Name": "국제약품"},
-    {"Code": "434110", "Name": "경동제약"},
-    {"Code": "434120", "Name": "한미사이언스"},
-    {"Code": "434130", "Name": "유한양행"},
-    {"Code": "434140", "Name": "JW중외제약"},
-    {"Code": "434150", "Name": "JW신약"},
-    {"Code": "434160", "Name": "동아에스티"},
-    {"Code": "434170", "Name": "종근당바이오"},
-    {"Code": "434180", "Name": "종근당홀딩스"},
-    {"Code": "434190", "Name": "일양약품"},
-    {"Code": "434200", "Name": "대원제약"},
-    {"Code": "434210", "Name": "삼아제약"},
-    {"Code": "434220", "Name": "한국유나이티드제약"},
-    {"Code": "434230", "Name": "한국콜마"},
-    {"Code": "434240", "Name": "코스맥스"},
-    {"Code": "434250", "Name": "아모레퍼시픽"},
-    {"Code": "434260", "Name": "LG생활건강"},
-    {"Code": "434270", "Name": "애경산업"},
-    {"Code": "434280", "Name": "토니모리"},
-    {"Code": "434290", "Name": "잇츠한불"},
-    {"Code": "434300", "Name": "네이처리퍼블릭"},
-    {"Code": "434310", "Name": "마녀공장"},
-    {"Code": "434320", "Name": "본느"},
-    {"Code": "434330", "Name": "클리오"},
-    {"Code": "434340", "Name": "에이블씨엔씨"},
-    {"Code": "434350", "Name": "잇츠스킨"},
-    {"Code": "434360", "Name": "한국화장품제조"},
-    {"Code": "434370", "Name": "코리아나화장품"},
-    {"Code": "434380", "Name": "리더스코스메틱"},
-    {"Code": "434390", "Name": "셀바이오휴먼텍"},
-    {"Code": "434400", "Name": "콜마비앤에이치"},
-    {"Code": "434410", "Name": "한국콜마홀딩스"},
-    {"Code": "434420", "Name": "코스메카코리아"},
-    {"Code": "434430", "Name": "씨티케이"},
-    {"Code": "434440", "Name": "엔에프씨"},
-    {"Code": "434450", "Name": "에이피알"},
-    {"Code": "434460", "Name": "잉글우드랩"},
-    {"Code": "434470", "Name": "코스온"},
-    {"Code": "434480", "Name": "에스엔피제네틱스"},
-    {"Code": "434490", "Name": "제닉"},
-    {"Code": "434500", "Name": "에이씨티"},
-    {"Code": "434510", "Name": "모아라이프플러스"},
-    {"Code": "434520", "Name": "세화피앤씨"},
-    {"Code": "434530", "Name": "오가닉티코스메틱"},
-    {"Code": "434540", "Name": "현대바이오랜드"},
-    {"Code": "434550", "Name": "바이오랜드"},
-    {"Code": "434560", "Name": "에스디생명공학"},
-    {"Code": "434570", "Name": "제이준코스메틱"},
-    {"Code": "434580", "Name": "한국바이오젠"},
-    {"Code": "434590", "Name": "코스알엑스"},
-    {"Code": "434600", "Name": "닥터지"},
-    {"Code": "434610", "Name": "메디큐브"},
-    {"Code": "434620", "Name": "이니스프리"},
-    {"Code": "434630", "Name": "라네즈"},
-    {"Code": "434640", "Name": "설화수"},
-    {"Code": "434650", "Name": "헤라"},
-    {"Code": "434660", "Name": "프리메라"},
-    {"Code": "434670", "Name": "아이오페"},
-    {"Code": "434680", "Name": "한율"},
-    {"Code": "434690", "Name": "숨37"},
-    {"Code": "434700", "Name": "더페이스샵"},
-    {"Code": "434710", "Name": "네이처컬렉션"},
-    {"Code": "434720", "Name": "VDL"},
-    {"Code": "434730", "Name": "3CE"},
-    {"Code": "434740", "Name": "에뛰드하우스"},
-    {"Code": "434750", "Name": "미샤"},
-    {"Code": "434760", "Name": "스킨푸드"},
-    {"Code": "434770", "Name": "홀리카홀리카"},
-    {"Code": "434780", "Name": "토니모리"},
-    {"Code": "434790", "Name": "잇츠스킨"},
-    {"Code": "434800", "Name": "네이처리퍼블릭"},
-    {"Code": "434810", "Name": "더샘"},
-    {"Code": "434820", "Name": "아리따움"},
-    {"Code": "434830", "Name": "롭스"},
-    {"Code": "434840", "Name": "올리브영"},
-    {"Code": "434850", "Name": "CJ올리브영"},
-    {"Code": "434860", "Name": "GS리테일"},
-    {"Code": "434870", "Name": "롯데쇼핑"},
-    {"Code": "434880", "Name": "신세계"},
-    {"Code": "434890", "Name": "현대백화점"},
-    {"Code": "434900", "Name": "이마트"},
-    {"Code": "434910", "Name": "홈플러스"},
-    {"Code": "434920", "Name": "하나로마트"},
-    {"Code": "434930", "Name": "농협하나로유통"},
-    {"Code": "434940", "Name": "롯데마트"},
-    {"Code": "434950", "Name": "코스트코코리아"},
-    {"Code": "434960", "Name": "이케아코리아"},
-    {"Code": "434970", "Name": "스타벅스코리아"},
-    {"Code": "434980", "Name": "맥도날드"},
-    {"Code": "434990", "Name": "버거킹"},
-    {"Code": "435000", "Name": "KFC"},
-    {"Code": "435010", "Name": "파파이스"},
-    {"Code": "435020", "Name": "도미노피자"},
-    {"Code": "435030", "Name": "미스터피자"},
-    {"Code": "435040", "Name": "BBQ"},
-    {"Code": "435050", "Name": "교촌에프앤비"},
-    {"Code": "435060", "Name": "bhc"},
-    {"Code": "435070", "Name": "푸라닭"},
-    {"Code": "435080", "Name": "굽네치킨"},
-    {"Code": "435090", "Name": "치킨플러스"},
-    {"Code": "435100", "Name": "페리카나"},
-    {"Code": "435110", "Name": "멕시카나"},
-    {"Code": "435120", "Name": "호식이두마리치킨"},
-    {"Code": "435130", "Name": "또래오래"},
-    {"Code": "435140", "Name": "네네치킨"},
-    {"Code": "435150", "Name": "자담치킨"},
-    {"Code": "435160", "Name": "처갓집양념치킨"},
-    {"Code": "435170", "Name": "치킨매니아"},
-    {"Code": "435180", "Name": "치킨플러스"},
-    {"Code": "435190", "Name": "가마치통닭"},
-    {"Code": "435200", "Name": "훌랄라치킨"},
-    {"Code": "435210", "Name": "이춘봉인생치킨"},
-    {"Code": "435220", "Name": "지코바치킨"},
-    {"Code": "435230", "Name": "치킨더홈"},
-    {"Code": "435240", "Name": "계동치킨"},
-    {"Code": "435250", "Name": "돈치킨"},
-    {"Code": "435260", "Name": "불스치킨"},
-    {"Code": "435270", "Name": "치킨마루"},
-    {"Code": "435280", "Name": "호치킨"},
-    {"Code": "435290", "Name": "OK치킨"},
-    {"Code": "435300", "Name": "BBQ치킨"},
-    {"Code": "435310", "Name": "교촌치킨"},
-    {"Code": "435320", "Name": "굽네치킨"},
-    {"Code": "435330", "Name": "푸라닭"},
-    {"Code": "435340", "Name": "bhc치킨"},
-    {"Code": "435350", "Name": "네네치킨"},
-    {"Code": "435360", "Name": "호식이두마리치킨"},
-    {"Code": "435370", "Name": "멕시카나"},
-    {"Code": "435380", "Name": "페리카나"},
-    {"Code": "435390", "Name": "또래오래"},
-    {"Code": "435400", "Name": "자담치킨"},
-    {"Code": "435410", "Name": "처갓집양념치킨"},
-    {"Code": "435420", "Name": "치킨매니아"},
-    {"Code": "435430", "Name": "치킨플러스"},
-    {"Code": "435440", "Name": "가마치통닭"},
-    {"Code": "435450", "Name": "훌랄라치킨"},
-    {"Code": "435460", "Name": "이춘봉인생치킨"},
-    {"Code": "435470", "Name": "지코바치킨"},
-    {"Code": "435480", "Name": "치킨더홈"},
-    {"Code": "435490", "Name": "계동치킨"},
-    {"Code": "435500", "Name": "돈치킨"},
-    {"Code": "435510", "Name": "불스치킨"},
-    {"Code": "435520", "Name": "치킨마루"},
-    {"Code": "435530", "Name": "호치킨"},
-    {"Code": "435540", "Name": "OK치킨"},
-    {"Code": "435550", "Name": "BBQ치킨"},
-    {"Code": "435560", "Name": "교촌치킨"},
-    {"Code": "435570", "Name": "굽네치킨"},
-    {"Code": "435580", "Name": "푸라닭"},
-    {"Code": "435590", "Name": "bhc치킨"},
-    {"Code": "435600", "Name": "네네치킨"},
-    {"Code": "435610", "Name": "호식이두마리치킨"},
-    {"Code": "435620", "Name": "멕시카나"},
-    {"Code": "435630", "Name": "페리카나"},
-    {"Code": "435640", "Name": "또래오래"},
-    {"Code": "435650", "Name": "자담치킨"},
-    {"Code": "435660", "Name": "처갓집양념치킨"},
-    {"Code": "435670", "Name": "치킨매니아"},
-    {"Code": "435680", "Name": "치킨플러스"},
-    {"Code": "435690", "Name": "가마치통닭"},
-    {"Code": "435700", "Name": "훌랄라치킨"},
-    {"Code": "435710", "Name": "이춘봉인생치킨"},
-    {"Code": "435720", "Name": "지코바치킨"},
-    {"Code": "435730", "Name": "치킨더홈"},
-    {"Code": "435740", "Name": "계동치킨"},
-    {"Code": "435750", "Name": "돈치킨"},
-    {"Code": "435760", "Name": "불스치킨"},
-    {"Code": "435770", "Name": "치킨마루"},
-    {"Code": "435780", "Name": "호치킨"},
-    {"Code": "435790", "Name": "OK치킨"},
-    {"Code": "435800", "Name": "BBQ치킨"},
-    {"Code": "435810", "Name": "교촌치킨"},
-    {"Code": "435820", "Name": "굽네치킨"},
-    {"Code": "435830", "Name": "푸라닭"},
-    {"Code": "435840", "Name": "bhc치킨"},
-    {"Code": "435850", "Name": "네네치킨"},
-    {"Code": "435860", "Name": "호식이두마리치킨"},
-    {"Code": "435870", "Name": "멕시카나"},
-    {"Code": "435880", "Name": "페리카나"},
-    {"Code": "435890", "Name": "또래오래"},
-    {"Code": "435900", "Name": "자담치킨"},
-    {"Code": "435910", "Name": "처갓집양념치킨"},
-    {"Code": "435920", "Name": "치킨매니아"},
-    {"Code": "435930", "Name": "치킨플러스"},
-    {"Code": "435940", "Name": "가마치통닭"},
-    {"Code": "435950", "Name": "훌랄라치킨"},
-    {"Code": "435960", "Name": "이춘봉인생치킨"},
-    {"Code": "435970", "Name": "지코바치킨"},
-    {"Code": "435980", "Name": "치킨더홈"},
-    {"Code": "435990", "Name": "계동치킨"},
-    {"Code": "436000", "Name": "돈치킨"},
-    {"Code": "436010", "Name": "불스치킨"},
-    {"Code": "436020", "Name": "치킨마루"},
-    {"Code": "436030", "Name": "호치킨"},
-    {"Code": "436040", "Name": "OK치킨"},
-    {"Code": "436050", "Name": "BBQ치킨"},
-    {"Code": "436060", "Name": "교촌치킨"},
-    {"Code": "436070", "Name": "굽네치킨"},
-    {"Code": "436080", "Name": "푸라닭"},
-    {"Code": "436090", "Name": "bhc치킨"},
-    {"Code": "436100", "Name": "네네치킨"},
-    {"Code": "436110", "Name": "호식이두마리치킨"},
-    {"Code": "436120", "Name": "멕시카나"},
-    {"Code": "436130", "Name": "페리카나"},
-    {"Code": "436140", "Name": "또래오래"},
-    {"Code": "436150", "Name": "자담치킨"},
-    {"Code": "436160", "Name": "처갓집양념치킨"},
-    {"Code": "436170", "Name": "치킨매니아"},
-    {"Code": "436180", "Name": "치킨플러스"},
-    {"Code": "436190", "Name": "가마치통닭"},
-    {"Code": "436200", "Name": "훌랄라치킨"},
-    {"Code": "436210", "Name": "이춘봉인생치킨"},
-    {"Code": "436220", "Name": "지코바치킨"},
-    {"Code": "436230", "Name": "치킨더홈"},
-    {"Code": "436240", "Name": "계동치킨"},
-    {"Code": "436250", "Name": "돈치킨"},
-    {"Code": "436260", "Name": "불스치킨"},
-    {"Code": "436270", "Name": "치킨마루"},
-    {"Code": "436280", "Name": "호치킨"},
-    {"Code": "436290", "Name": "OK치킨"},
-    {"Code": "436300", "Name": "BBQ치킨"},
-])
+# ---------- 종목 검색 데이터 ----------
+# 검색은 네이버 자동완성에만 의존하지 않고 KRX 전체 종목 목록을 함께 사용한다.
+# 특히 "부동산"처럼 종목명 중간에 포함된 문자열도 모두 찾는다.
+krx_df = pd.DataFrame()
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_krx_listing():
+    """국내 주식/ETF 종목명 검색용 전체 목록. FDR 단일 장애를 피하기 위해 Naver API를 폴백으로 사용."""
+    frames = []
+
+    def normalize(df):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Code", "Name"])
+        code_col = next((c for c in ["Code", "Symbol", "symbolCode", "itemcode"] if c in df.columns), None)
+        name_col = next((c for c in ["Name", "name", "stockName", "stockNameKor", "stockNameEng", "itemname"] if c in df.columns), None)
+        if code_col is None or name_col is None:
+            return pd.DataFrame(columns=["Code", "Name"])
+        out = df[[code_col, name_col]].copy()
+        out.columns = ["Code", "Name"]
+        out["Code"] = out["Code"].astype(str).str.extract(r"(\d{6})", expand=False)
+        out["Name"] = out["Name"].astype(str).str.replace(r"<[^>]+>", "", regex=True).str.replace("\xa0", " ", regex=False).str.strip()
+        out = out.dropna(subset=["Code", "Name"])
+        out = out[(out["Code"].str.len() == 6) & (out["Name"] != "") & (out["Name"].str.lower() != "nan")]
+        return out.drop_duplicates("Code")
+
+    # FDR: KRX가 정상인 환경에서는 가장 빠른 경로
+    for market in ["KRX", "KRX-DESC", "KOSPI", "KOSDAQ", "KONEX"]:
+        try:
+            n = normalize(fdr.StockListing(market))
+            if not n.empty:
+                frames.append(n)
+        except Exception as e:
+            logging.warning("FDR %s 실패: %s", market, e)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
+        "Referer": "https://finance.naver.com/",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
+    def naver_exchange(exchange):
+        rows = []
+        size = 100
+        try:
+            first = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page=1&pageSize={size}", headers=headers, timeout=10)
+            first.raise_for_status()
+            obj = first.json()
+            total = int(obj.get("totalCount", 0) or 0)
+            pages = min(max(1, (total + size - 1) // size), 100)
+            all_pages = [obj]
+            for page in range(2, pages + 1):
+                try:
+                    rr = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page={page}&pageSize={size}", headers=headers, timeout=10)
+                    rr.raise_for_status()
+                    all_pages.append(rr.json())
+                except Exception as e:
+                    logging.warning("Naver %s page %d 실패: %s", exchange, page, e)
+                    break
+            for page_obj in all_pages:
+                for item in page_obj.get("stocks", []) or []:
+                    code = str(item.get("symbolCode", "")).strip()
+                    name = (item.get("stockName") or item.get("stockNameKor") or item.get("stockNameEng") or item.get("name") or "")
+                    name = re.sub(r"<[^>]+>", "", str(name)).strip()
+                    if re.fullmatch(r"\d{6}", code) and name:
+                        rows.append({"Code": code, "Name": name})
+        except Exception as e:
+            logging.warning("Naver %s 목록 실패: %s", exchange, e)
+        return normalize(pd.DataFrame(rows))
+
+    for exchange in ["KOSPI", "KOSDAQ", "KONEX"]:
+        n = naver_exchange(exchange)
+        if not n.empty:
+            frames.append(n)
+
+    # ETF도 종목명 검색 대상에 포함
+    try:
+        r = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", headers=headers, timeout=10)
+        r.raise_for_status()
+        etfs = r.json().get("result", {}).get("etfItemList", []) or []
+        rows = [{"Code": str(x.get("itemcode", "")).strip(), "Name": str(x.get("itemname", "")).strip()} for x in etfs]
+        n = normalize(pd.DataFrame(rows))
+        if not n.empty:
+            frames.append(n)
+    except Exception as e:
+        logging.warning("Naver ETF 목록 실패: %s", e)
+
+    if not frames:
+        logging.error("국내 종목 목록을 확보하지 못했습니다.")
+        return pd.DataFrame(columns=["Code", "Name"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out["Code"] = out["Code"].astype(str).str.zfill(6)
+    out["Name"] = out["Name"].astype(str).str.strip()
+    out = out.drop_duplicates("Code").reset_index(drop=True)
+    logging.info("국내 검색 DB 확보: %d개", len(out))
+    return out
+
+
+def search_naver_autocomplete(query):
+    """네이버 자동완성 검색. 실패해도 전체 검색은 계속 진행한다."""
+    url = "https://ac.finance.naver.com/ac"
+    params = {
+        "q": query,
+        "target": "stock",
+        "mode": "json"
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        result = []
+        for item in data.get('items', []):
+            if isinstance(item, list) and len(item) >= 2:
+                code = str(item[0]).strip()
+                name = re.sub(r'<[^>]+>', '', str(item[1])).strip()
+                if re.fullmatch(r'\d{6}', code) and name:
+                    result.append({'code': code, 'name': name})
+        return result
+    except Exception as e:
+        logging.warning(f"네이버 자동완성 검색 실패: {e}")
+        return []
+
+
+def search_stock_list(query, max_results=200):
+    """
+    종목명/코드 검색의 통합 엔진.
+
+    우선순위:
+      1. 네이버 자동완성 결과
+      2. KRX 전체 목록에서 '종목명에 검색어가 포함'된 모든 종목
+
+    예:
+      '부동산' -> 이름에 '부동산'이 들어있는 KRX 종목을 전부 반환
+      '하이닉스' -> SK하이닉스 등 부분일치 결과 반환
+      '005930' -> 삼성전자 반환
+    """
+    query = str(query or '').strip()
+    if not query:
+        return []
+
+    # 숫자 코드 검색
+    if query.isdigit():
+        qcode = query.zfill(6)
+        if len(qcode) == 6:
+            df = load_krx_listing()
+            if not df.empty:
+                hit = df[df['Code'] == qcode]
+                if not hit.empty:
+                    return [
+                        {'code': str(r.Code), 'name': str(r.Name)}
+                        for r in hit.itertuples(index=False)
+                    ]
+            # KRX 목록이 일시적으로 실패하면 네이버 자동완성도 시도
+            return search_naver_autocomplete(query)
+        return []
+
+    q = query.casefold()
+    results = []
+
+    # 1) 네이버 자동완성 결과를 먼저 확보
+    results.extend(search_naver_autocomplete(query))
+
+    # 2) KRX 전체 목록에서 '종목명 부분일치' 검색
+    df = load_krx_listing()
+    if not df.empty:
+        names = df['Name'].astype(str)
+        mask = names.str.casefold().str.contains(q, regex=False, na=False)
+        hits = df.loc[mask, ['Code', 'Name']]
+
+        # 검색어가 이름에 정확히/앞부분에 가까운 종목을 먼저 배치
+        exact = hits[hits['Name'].str.casefold() == q]
+        starts = hits[
+            hits['Name'].str.casefold().str.startswith(q) &
+            (hits['Name'].str.casefold() != q)
+        ]
+        contains = hits[
+            ~hits['Name'].str.casefold().str.startswith(q)
+        ]
+
+        ordered = pd.concat([exact, starts, contains], ignore_index=True)
+        results.extend(
+            {'code': str(r.Code), 'name': str(r.Name)}
+            for r in ordered.itertuples(index=False)
+        )
+
+    # 중복 제거 + 최대 결과 수 제한
+    unique = []
+    seen = set()
+    for item in results:
+        code = str(item.get('code', '')).strip()
+        name = str(item.get('name', '')).strip()
+        key = code or name
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append({'code': code, 'name': name})
+        if len(unique) >= max_results:
+            break
+
+    return unique
+
+
+# ---------- 종목명 & 코드 정밀 매칭 ----------
+def get_code_and_name(query):
+    global krx_df
+    query = str(query or '').strip()
+
+    if query.isdigit() and len(query) == 6:
+        results = search_stock_list(query, max_results=1)
+        if results:
+            return results[0]['code'], results[0]['name']
+
+        code = query
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            name_elem = soup.select_one('.wrap_company h2 a')
+            if name_elem:
+                return code, name_elem.text.strip()
+        except Exception:
+            pass
+        return code, code
+
+    results = search_stock_list(query, max_results=1)
+    if results:
+        return results[0]['code'], results[0]['name']
+
+    return None, None
+
+
+# ---------- 네이버 월봉 가격 데이터 스크래핑 ----------
+def _get_naver_monthly_price(code):
+    """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
+    url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = 'cp949'
+        tables = pd.read_html(StringIO(res.text), encoding='cp949')
+        if tables:
+            df = tables[0].copy()
+            if '날짜' in df.columns:
+                df['날짜'] = pd.to_datetime(df['날짜'], format='%Y.%m.%d')
+                df = df.set_index('날짜')
+                df = df.rename(columns={
+                    '시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'
+                })
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                df = df.apply(pd.to_numeric, errors='coerce')
+                df = df.sort_index()
+                return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
 
 # ---------- 가격 데이터 다중 소스 폴백 ----------
 def get_price_data(code, name, start_date):
-    # 1) FinanceDataReader
+    """
+    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
+    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
+    """
+    # 1) FinanceDataReader (Yahoo)
     try:
         df = fdr.DataReader(code, start=start_date)
         if df is not None and not df.empty:
             df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"FinanceDataReader failed: {e}")
 
-    # 2) yfinance
+    # 2) yfinance 직접 호출
     for suffix in ['.KS', '.KQ']:
         try:
             ticker = f"{code}{suffix}"
@@ -575,30 +306,15 @@ def get_price_data(code, name, start_date):
                 df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
                 df.index = df.index.tz_localize(None)
                 return df
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"yfinance failed for {ticker}: {e}")
 
-    # 3) 네이버 월봉
-    try:
-        url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'cp949'
-        tables = pd.read_html(StringIO(res.text), encoding='cp949')
-        if tables:
-            df = tables[0].copy()
-            if '날짜' in df.columns:
-                df['날짜'] = pd.to_datetime(df['날짜'], format='%Y.%m.%d')
-                df = df.set_index('날짜')
-                df = df.rename(columns={'시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'})
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df = df.apply(pd.to_numeric, errors='coerce')
-                df = df.sort_index()
-                cutoff = datetime.today() - timedelta(days=365 * 11)
-                df = df[df.index >= cutoff]
-                return df
-    except Exception:
-        pass
+    # 3) 네이버 금융 월봉 데이터
+    df_naver = _get_naver_monthly_price(code)
+    if not df_naver.empty:
+        cutoff = datetime.today() - timedelta(days=365 * 11)
+        df_naver = df_naver[df_naver.index >= cutoff]
+        return df_naver
 
     return pd.DataFrame()
 
@@ -790,22 +506,40 @@ def get_pure_real_fundamentals(code, name, df_price_full):
         q_growth_yoy.append(yoy)
 
     fin_payload["quarterly"] = {
-        "labels": q_labels, "profit": q_prof, "revenue": q_rev, "net": q_net,
-        "opm": q_opm, "prices": q_prices, "growth_yoy": q_growth_yoy
+        "labels": q_labels,
+        "profit": q_prof,
+        "revenue": q_rev,
+        "net": q_net,
+        "opm": q_opm,
+        "prices": q_prices,
+        "growth_yoy": q_growth_yoy
     }
     fin_payload["semiannual"] = {
-        "labels": q_labels[::2], "profit": q_prof[::2], "revenue": q_rev[::2], "net": q_net[::2],
-        "opm": q_opm[::2], "prices": q_prices[::2], "growth_yoy": q_growth_yoy[::2]
+        "labels": q_labels[::2],
+        "profit": q_prof[::2],
+        "revenue": q_rev[::2],
+        "net": q_net[::2],
+        "opm": q_opm[::2],
+        "prices": q_prices[::2],
+        "growth_yoy": q_growth_yoy[::2]
     }
     fin_payload["annual"] = {
-        "labels": [l[:4] + "년" for l in q_labels[::4]], "profit": q_prof[::4], "revenue": q_rev[::4],
-        "net": q_net[::4], "opm": q_opm[::4], "prices": q_prices[::4], "growth_yoy": q_growth_yoy[::4]
+        "labels": [l[:4] + "년" for l in q_labels[::4]],
+        "profit": q_prof[::4],
+        "revenue": q_rev[::4],
+        "net": q_net[::4],
+        "opm": q_opm[::4],
+        "prices": q_prices[::4],
+        "growth_yoy": q_growth_yoy[::4]
     }
 
     recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
     fin_payload["growth_model"] = {
-        "est_per": 15.0, "growth_rate": recent_yoy, "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)
+        "est_per": 15.0,
+        "growth_rate": recent_yoy,
+        "peg": 1.0,
+        "target_peg_05": int(cur_price * 0.8),
+        "target_peg_10": int(cur_price * 1.05)
     }
     return fin_payload
 
@@ -885,8 +619,13 @@ def calculate_multi_period_engine(code, name):
         floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
         gap = ((latest_price - floor_price) / floor_price) * 100
         matrix_table.append({
-            "key": key, "period": label, "allocation": alloc, "max_yield": p_max_yield,
-            "floor_price": floor_price, "gap": gap, "diff_won": latest_price - floor_price,
+            "key": key,
+            "period": label,
+            "allocation": alloc,
+            "max_yield": p_max_yield,
+            "floor_price": floor_price,
+            "gap": gap,
+            "diff_won": latest_price - floor_price,
             "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
             "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
         })
@@ -918,19 +657,35 @@ def calculate_multi_period_engine(code, name):
     }
 
     return {
-        "code": code, "name": name, "latest_price": latest_price, "change_pct": change_pct,
-        "current_yield": current_yield, "current_dps": real_dps, "matrix": matrix_table,
-        "buy_step_1": buy_step_1, "buy_step_2": buy_step_2, "buy_step_3": buy_step_3,
-        "div_1y": div_1y, "div_5y": div_5y, "peg_fair": peg_fair, "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100), "w_growth": int(w_growth * 100), "profile_desc": profile_desc,
-        "fin_data": fin_data, "chart_payload": chart_payload
+        "code": code,
+        "name": name,
+        "latest_price": latest_price,
+        "change_pct": change_pct,
+        "current_yield": current_yield,
+        "current_dps": real_dps,
+        "matrix": matrix_table,
+        "buy_step_1": buy_step_1,
+        "buy_step_2": buy_step_2,
+        "buy_step_3": buy_step_3,
+        "div_1y": div_1y,
+        "div_5y": div_5y,
+        "peg_fair": peg_fair,
+        "peg_bottom": peg_bottom,
+        "w_div": int(w_div * 100),
+        "w_growth": int(w_growth * 100),
+        "profile_desc": profile_desc,
+        "fin_data": fin_data,
+        "chart_payload": chart_payload
     }
 
 
-# ---------- GUI 렌더링 함수 ----------
+# ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
     if code is None or name is None:
+        code, name = get_code_and_name(query)
+    if not code:
         return None
+
     data = calculate_multi_period_engine(code, name)
     if not data:
         return None
@@ -951,6 +706,45 @@ def generate_v39_dashboard(query, code=None, name=None):
     w_growth = data['w_growth']
     profile_desc = data['profile_desc']
 
+    # IMPORTANT: 중첩 f-string + JavaScript 중괄호로 인한 SyntaxError 방지
+    matrix_rows = "".join(
+        f"""
+        <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
+            <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
+            <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
+            <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
+            <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
+            <td class="py-2.5 px-2.5 {('text-red-400 font-bold' if m['gap'] <= 0 else ('text-amber-400' if m['gap'] <= 3 else 'text-slate-300'))}">
+                {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
+            </td>
+            <td class="py-2.5 px-2.5 text-center">
+                <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
+            </td>
+        </tr>
+        """
+        for m in data['matrix']
+    )
+
+    news_html = "".join(
+        f"""
+        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+            <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
+        </a>
+        """
+        for n in news_items
+    ) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'
+
+    notice_html = "".join(
+        f"""
+        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+            <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
+        </a>
+        """
+        for n in notice_items
+    ) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'
+
     html_content = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -969,6 +763,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 </head>
 <body class="p-3 md:p-6 custom-scroll">
     <div class="max-w-6xl mx-auto space-y-4">
+        
         <!-- 상단 헤더 -->
         <div class="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-2xl backdrop-blur-md flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
@@ -992,7 +787,7 @@ def generate_v39_dashboard(query, code=None, name=None):
             </div>
         </div>
 
-        <!-- 마스터 매매 결론 -->
+        <!-- [최상단 배치] 종목 맞춤형 동적 가중치 3단계 매수 전략 마스터 결론 카드 -->
         <div class="p-5 rounded-2xl border shadow-2xl bg-gradient-to-r from-slate-900 via-indigo-950/80 to-slate-900 border-indigo-500/50 space-y-3">
             <div class="flex items-center justify-between border-b border-slate-800 pb-2">
                 <div class="flex items-center gap-2">
@@ -1032,8 +827,10 @@ def generate_v39_dashboard(query, code=None, name=None):
 
         <!-- 메인 레이아웃 -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            
             <div class="lg:col-span-2 space-y-4">
-                <!-- 배당 뷰 -->
+                
+                <!-- [VIEW 1] 배당 가치 분석 뷰 -->
                 <div id="sectionDividendView" class="space-y-4">
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-blue-500/40 space-y-1">
                         <p class="text-xs text-blue-400 font-bold">💰 배당 성장 기반 단독 매수 전략 (실시간 자동 DPS 반영)</p>
@@ -1061,21 +858,8 @@ def generate_v39_dashboard(query, code=None, name=None):
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800/60 font-medium cursor-pointer">
-                                    {"".join([f'''
-                                    <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
-                                        <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
-                                        <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
-                                        <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
-                                        <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
-                                        <td class="py-2.5 px-2.5 {'text-red-400 font-bold' if m['gap']<=0 else ('text-amber-400' if m['gap']<=3 else 'text-slate-300')}">
-                                            {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
-                                        </td>
-                                        <td class="py-2.5 px-2.5 text-center">
-                                            <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
-                                        </td>
-                                    </tr>
-                                    ''' for m in data['matrix']])}
-                                </tbody>
+                                    {matrix_rows}
+                    </tbody>
                             </table>
                         </div>
                     </div>
@@ -1115,7 +899,7 @@ def generate_v39_dashboard(query, code=None, name=None):
                     </div>
                 </div>
 
-                <!-- 실적 성장 뷰 -->
+                <!-- [VIEW 2] 실적 성장 분석 뷰 -->
                 <div id="sectionGrowthView" class="space-y-4 hidden">
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-emerald-500/40 space-y-1">
                         <p class="text-xs text-emerald-400 font-bold">🚀 실적 성장(PEG) 기반 단독 매수 전략 (실데이터 연동)</p>
@@ -1191,6 +975,7 @@ def generate_v39_dashboard(query, code=None, name=None):
                         <div class="relative h-[360px] w-full"><canvas id="growthChart"></canvas></div>
                     </div>
                 </div>
+
             </div>
 
             <!-- 우측 뉴스/공시 -->
@@ -1200,23 +985,15 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <button id="tabNoticeBtn" onclick="switchTab('notice')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition">📑 공시</button>
                 </div>
                 <div id="feedNews" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
+                    {news_html}
                 </div>
                 <div id="feedNotice" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll hidden">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
+                    {notice_html}
                 </div>
             </div>
+
         </div>
+
     </div>
 
     <script>
@@ -1470,7 +1247,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.8 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.4 대시보드 렌더링 완료!")
     return html_content
 
 
@@ -1478,53 +1255,100 @@ def generate_v39_dashboard(query, code=None, name=None):
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-st.markdown("종목명 또는 코드를 입력하세요. **내장된 주요 종목(200개)에서 검색됩니다.**")
+st.markdown(
+    "종목명, 일부 단어 또는 종목코드를 검색하세요. "
+    "**검색어가 종목명에 포함된 모든 종목을 찾아 선택할 수 있습니다.**"
+)
 
-user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스, 부동산, 맥쿼리)", value="")
+user_query = st.text_input(
+    "🔎 종목 검색",
+    value="",
+    placeholder="예: 부동산 / 리츠 / 하이닉스 / 삼성 / 005930"
+).strip()
 
 if user_query:
-    user_query = user_query.strip()
     selected_code = None
     selected_name = None
 
-    # 1) 6자리 숫자 코드 입력
+    # 1) 6자리 종목코드
     if user_query.isdigit() and len(user_query) == 6:
-        selected_code = user_query
-        match = EMBEDDED_STOCK_LIST[EMBEDDED_STOCK_LIST['Code'] == selected_code]
-        if not match.empty:
-            selected_name = match.iloc[0]['Name']
+        results = search_stock_list(user_query, max_results=10)
+        if results:
+            if len(results) == 1:
+                selected_code = results[0]['code']
+                selected_name = results[0]['name']
+            else:
+                options = [f"{x['name']} ({x['code']})" for x in results]
+                selected_option = st.selectbox("분석할 종목을 선택하세요", options, key="stock_selector")
+                idx = options.index(selected_option)
+                selected_code = results[idx]['code']
+                selected_name = results[idx]['name']
         else:
-            selected_name = selected_code  # fallback
-
-    # 2) 종목명 또는 부분 검색어
-    else:
-        matches = EMBEDDED_STOCK_LIST[EMBEDDED_STOCK_LIST['Name'].str.contains(user_query, case=False, na=False)]
-        if len(matches) == 0:
-            st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
-        elif len(matches) == 1:
-            selected_code = matches.iloc[0]['Code']
-            selected_name = matches.iloc[0]['Name']
-        else:
-            st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(matches)}개)")
-            options = [f"{row['Name']} ({row['Code']})" for _, row in matches.iterrows()]
-            selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
-            if selected_option:
-                code_part = selected_option.split('(')[-1].rstrip(')')
-                selected_code = code_part
-                selected_name = selected_option.split(' (')[0]
-
-    # 3) 분석 실행
-    if selected_code and selected_name:
-        with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+            # 코드가 KRX 목록에 없더라도 네이버에서 종목명을 확인
+            selected_code = user_query
             try:
-                html_str = generate_v39_dashboard(
-                    query=user_query,
-                    code=selected_code,
-                    name=selected_name
-                )
-                if html_str:
-                    st.components.v1.html(html_str, height=1200, scrolling=True)
-                else:
-                    st.error("대시보드 생성에 실패했습니다.")
-            except Exception as e:
-                st.error(f"오류가 발생했습니다: {str(e)}")
+                url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
+                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                name_elem = soup.select_one('.wrap_company h2 a')
+                selected_name = name_elem.text.strip() if name_elem else None
+            except Exception:
+                selected_name = None
+
+            if not selected_name:
+                st.error("해당 종목코드를 찾지 못했습니다. 코드를 확인해주세요.")
+
+    # 2) 종목명/부분 검색
+    else:
+        search_results = search_stock_list(user_query, max_results=200)
+
+        if not search_results:
+            st.warning(
+                f"'{user_query}'가 종목명에 포함된 종목을 찾지 못했습니다. "
+                "다른 검색어를 입력해보세요."
+            )
+        else:
+            st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
+            st.caption("종목명에 검색어가 포함된 종목을 모두 표시합니다. 아래에서 분석할 종목을 선택하세요.")
+
+            options = [f"{item['name']}  |  {item['code']}" for item in search_results]
+            selected_option = st.selectbox(
+                "📌 분석할 종목 선택",
+                options,
+                key=f"stock_selector_{user_query}"
+            )
+
+            if selected_option:
+                selected_idx = options.index(selected_option)
+                selected_code = search_results[selected_idx]['code']
+                selected_name = search_results[selected_idx]['name']
+
+            # 검색 결과를 간단한 표로도 보여줘 선택 대상을 확인하기 쉽게 함
+            result_table = pd.DataFrame(search_results)
+            result_table.columns = ['종목코드', '종목명']
+            st.dataframe(
+                result_table,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 35 * len(result_table) + 45)
+            )
+
+    # 3) 선택한 종목 분석
+    if selected_code and selected_name:
+        st.info(f"선택 종목: **{selected_name} ({selected_code})**")
+        if st.button("🚀 선택 종목 분석 실행", type="primary", use_container_width=True):
+            with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+                try:
+                    html_str = generate_v39_dashboard(
+                        query=user_query,
+                        code=selected_code,
+                        name=selected_name
+                    )
+                    if html_str:
+                        st.components.v1.html(html_str, height=1200, scrolling=True)
+                    else:
+                        st.error("대시보드 생성에 실패했습니다.")
+                except Exception as e:
+                    logging.exception("대시보드 생성 오류")
+                    st.error(f"오류가 발생했습니다: {str(e)}")
+

@@ -1,6 +1,6 @@
 # ============================================================
-# [v39.4] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 네이버 자동완성 API를 활용한 종목 검색 리스트
+# [v39.6] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 네이버 모바일 검색 API 우선 적용 (종목 리스트 즉시 표시)
 #         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
 
@@ -21,238 +21,132 @@ import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-# ---------- 종목 검색 데이터 ----------
-# 검색은 네이버 자동완성에만 의존하지 않고 KRX 전체 종목 목록을 함께 사용한다.
-# 특히 "부동산"처럼 종목명 중간에 포함된 문자열도 모두 찾는다.
-krx_df = pd.DataFrame()
-
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def load_krx_listing():
-    """국내 주식/ETF 종목명 검색용 전체 목록. FDR 단일 장애를 피하기 위해 Naver API를 폴백으로 사용."""
-    frames = []
-
-    def normalize(df):
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["Code", "Name"])
-        code_col = next((c for c in ["Code", "Symbol", "symbolCode", "itemcode"] if c in df.columns), None)
-        name_col = next((c for c in ["Name", "name", "stockName", "stockNameKor", "stockNameEng", "itemname"] if c in df.columns), None)
-        if code_col is None or name_col is None:
-            return pd.DataFrame(columns=["Code", "Name"])
-        out = df[[code_col, name_col]].copy()
-        out.columns = ["Code", "Name"]
-        out["Code"] = out["Code"].astype(str).str.extract(r"(\d{6})", expand=False)
-        out["Name"] = out["Name"].astype(str).str.replace(r"<[^>]+>", "", regex=True).str.replace("\xa0", " ", regex=False).str.strip()
-        out = out.dropna(subset=["Code", "Name"])
-        out = out[(out["Code"].str.len() == 6) & (out["Name"] != "") & (out["Name"].str.lower() != "nan")]
-        return out.drop_duplicates("Code")
-
-    # FDR: KRX가 정상인 환경에서는 가장 빠른 경로
-    for market in ["KRX", "KRX-DESC", "KOSPI", "KOSDAQ", "KONEX"]:
-        try:
-            n = normalize(fdr.StockListing(market))
-            if not n.empty:
-                frames.append(n)
-        except Exception as e:
-            logging.warning("FDR %s 실패: %s", market, e)
-
+# ---------- 네이버 금융 종목 검색 (다중 API 폴백) ----------
+def search_stock_list(query):
+    """
+    네이버 금융 검색 API를 여러 방식으로 시도하여 종목 리스트를 반환한다.
+    Returns: list of dict [{"code": "000660", "name": "SK하이닉스"}]
+    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
-        "Referer": "https://finance.naver.com/",
-        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://m.stock.naver.com/"
     }
 
-    def naver_exchange(exchange):
-        rows = []
-        size = 100
-        try:
-            first = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page=1&pageSize={size}", headers=headers, timeout=10)
-            first.raise_for_status()
-            obj = first.json()
-            total = int(obj.get("totalCount", 0) or 0)
-            pages = min(max(1, (total + size - 1) // size), 100)
-            all_pages = [obj]
-            for page in range(2, pages + 1):
-                try:
-                    rr = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page={page}&pageSize={size}", headers=headers, timeout=10)
-                    rr.raise_for_status()
-                    all_pages.append(rr.json())
-                except Exception as e:
-                    logging.warning("Naver %s page %d 실패: %s", exchange, page, e)
-                    break
-            for page_obj in all_pages:
-                for item in page_obj.get("stocks", []) or []:
-                    code = str(item.get("symbolCode", "")).strip()
-                    name = (item.get("stockName") or item.get("stockNameKor") or item.get("stockNameEng") or item.get("name") or "")
-                    name = re.sub(r"<[^>]+>", "", str(name)).strip()
-                    if re.fullmatch(r"\d{6}", code) and name:
-                        rows.append({"Code": code, "Name": name})
-        except Exception as e:
-            logging.warning("Naver %s 목록 실패: %s", exchange, e)
-        return normalize(pd.DataFrame(rows))
-
-    for exchange in ["KOSPI", "KOSDAQ", "KONEX"]:
-        n = naver_exchange(exchange)
-        if not n.empty:
-            frames.append(n)
-
-    # ETF도 종목명 검색 대상에 포함
+    # 1) 네이버 금융 자동완성 API (가장 안정적이고 빠름 - 구조 수정)
     try:
-        r = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", headers=headers, timeout=10)
-        r.raise_for_status()
-        etfs = r.json().get("result", {}).get("etfItemList", []) or []
-        rows = [{"Code": str(x.get("itemcode", "")).strip(), "Name": str(x.get("itemname", "")).strip()} for x in etfs]
-        n = normalize(pd.DataFrame(rows))
-        if not n.empty:
-            frames.append(n)
-    except Exception as e:
-        logging.warning("Naver ETF 목록 실패: %s", e)
-
-    if not frames:
-        logging.error("국내 종목 목록을 확보하지 못했습니다.")
-        return pd.DataFrame(columns=["Code", "Name"])
-
-    out = pd.concat(frames, ignore_index=True)
-    out["Code"] = out["Code"].astype(str).str.zfill(6)
-    out["Name"] = out["Name"].astype(str).str.strip()
-    out = out.drop_duplicates("Code").reset_index(drop=True)
-    logging.info("국내 검색 DB 확보: %d개", len(out))
-    return out
-
-
-def search_naver_autocomplete(query):
-    """네이버 자동완성 검색. 실패해도 전체 검색은 계속 진행한다."""
-    url = "https://ac.finance.naver.com/ac"
-    params = {
-        "q": query,
-        "target": "stock",
-        "mode": "json"
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    try:
+        url = "https://ac.finance.naver.com/ac"
+        params = {"q": query, "q_enc": "utf-8", "st": "111", "target": "stock", "mode": "json"}
         res = requests.get(url, params=params, headers=headers, timeout=5)
         res.raise_for_status()
         data = res.json()
+        items = data.get("items", [])
         result = []
-        for item in data.get('items', []):
-            if isinstance(item, list) and len(item) >= 2:
-                code = str(item[0]).strip()
-                name = re.sub(r'<[^>]+>', '', str(item[1])).strip()
-                if re.fullmatch(r'\d{6}', code) and name:
-                    result.append({'code': code, 'name': name})
-        return result
+        if items and len(items) > 0:
+            for item in items[0]:
+                if isinstance(item, list) and len(item) >= 2:
+                    name = re.sub(r'<[^>]+>', '', str(item[0])).strip()
+                    code = str(item[1])
+                    result.append({"code": code, "name": name})
+        if result:
+            return result
     except Exception as e:
         logging.warning(f"네이버 자동완성 검색 실패: {e}")
-        return []
+
+    # 2) 네이버 모바일 주식 검색 API (폴백)
+    try:
+        url = "https://m.stock.naver.com/api/stocks/search"
+        params = {"keyword": query}
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        stocks = data.get("stocks", [])
+        if stocks:
+            result = []
+            for s in stocks:
+                code = s.get("stockCode", "")
+                name = s.get("stockName", "")
+                if code and name:
+                    result.append({"code": code, "name": name})
+            if result:
+                return result
+    except Exception as e:
+        logging.warning(f"네이버 모바일 검색 실패: {e}")
+
+    # 3) 네이버 증권 종목 검색 페이지 스크래핑 (최종 폴백 - 인코딩 수정)
+    try:
+        query_euc = query.encode('euc-kr').decode('iso-8859-1')
+        url = f"https://finance.naver.com/search/searchList.naver?query={query_euc}"
+        res = requests.get(url, headers=headers, timeout=5)
+        res.encoding = 'cp949'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        result = []
+        for row in soup.select('table.tbl_search tbody tr'):
+            a_tag = row.select_one('td.tit a')
+            if a_tag:
+                href = a_tag.get('href', '')
+                code_match = re.search(r'code=(\d{6})', href)
+                if code_match:
+                    code = code_match.group(1)
+                    name = a_tag.text.strip()
+                    result.append({"code": code, "name": name})
+        if result:
+            return result
+    except Exception as e:
+        logging.warning(f"네이버 검색 페이지 스크래핑 실패: {e}")
+
+    return []
 
 
-def search_stock_list(query, max_results=200):
+# ---------- 전체 종목 리스트 로딩 (캐시, 폴백) ----------
+@st.cache_data(ttl=3600)
+def get_all_stock_list():
     """
-    종목명/코드 검색의 통합 엔진.
-
-    우선순위:
-      1. 네이버 자동완성 결과
-      2. KRX 전체 목록에서 '종목명에 검색어가 포함'된 모든 종목
-
-    예:
-      '부동산' -> 이름에 '부동산'이 들어있는 KRX 종목을 전부 반환
-      '하이닉스' -> SK하이닉스 등 부분일치 결과 반환
-      '005930' -> 삼성전자 반환
+    전체 KRX 종목 리스트를 다양한 소스에서 순차적으로 가져온다.
+    Returns: DataFrame with columns ['Code', 'Name']
     """
-    query = str(query or '').strip()
-    if not query:
-        return []
+    # 1) FinanceDataReader (Symbol 컬럼 대응 수정)
+    try:
+        df = fdr.StockListing('KRX')
+        if df is not None and not df.empty:
+            if 'Symbol' in df.columns:
+                df = df.rename(columns={'Symbol': 'Code'})
+            if 'Code' in df.columns and 'Name' in df.columns:
+                return df[['Code', 'Name']].astype(str)
+    except Exception as e:
+        logging.warning(f"fdr.StockListing failed: {e}")
 
-    # 숫자 코드 검색
-    if query.isdigit():
-        qcode = query.zfill(6)
-        if len(qcode) == 6:
-            df = load_krx_listing()
-            if not df.empty:
-                hit = df[df['Code'] == qcode]
-                if not hit.empty:
-                    return [
-                        {'code': str(r.Code), 'name': str(r.Name)}
-                        for r in hit.itertuples(index=False)
-                    ]
-            # KRX 목록이 일시적으로 실패하면 네이버 자동완성도 시도
-            return search_naver_autocomplete(query)
-        return []
+    # 2) pykrx
+    try:
+        from pykrx import stock
+        codes = stock.get_market_ticker_list(market="ALL")
+        names = [stock.get_market_ticker_name(c) for c in codes]
+        return pd.DataFrame({'Code': codes, 'Name': names})
+    except Exception as e:
+        logging.warning(f"pykrx failed: {e}")
 
-    q = query.casefold()
-    results = []
+    # 3) KRX 데이터 API (JSON)
+    try:
+        url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+        params = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+            "locale": "ko_KOR",
+            "mktId": "ALL",
+            "trdDd": datetime.today().strftime('%Y%m%d'),
+            "money": "1",
+            "csvxls_isNo": "false"
+        }
+        res = requests.post(url, data=params, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        data = res.json()
+        out = data.get('OutBlock_1', [])
+        df = pd.DataFrame(out)
+        if not df.empty:
+            if 'ISU_SRT_CD' in df.columns and 'ISU_ABBRV' in df.columns:
+                df = df.rename(columns={'ISU_SRT_CD': 'Code', 'ISU_ABBRV': 'Name'})
+                return df[['Code', 'Name']].astype(str)
+    except Exception as e:
+        logging.warning(f"KRX API failed: {e}")
 
-    # 1) 네이버 자동완성 결과를 먼저 확보
-    results.extend(search_naver_autocomplete(query))
-
-    # 2) KRX 전체 목록에서 '종목명 부분일치' 검색
-    df = load_krx_listing()
-    if not df.empty:
-        names = df['Name'].astype(str)
-        mask = names.str.casefold().str.contains(q, regex=False, na=False)
-        hits = df.loc[mask, ['Code', 'Name']]
-
-        # 검색어가 이름에 정확히/앞부분에 가까운 종목을 먼저 배치
-        exact = hits[hits['Name'].str.casefold() == q]
-        starts = hits[
-            hits['Name'].str.casefold().str.startswith(q) &
-            (hits['Name'].str.casefold() != q)
-        ]
-        contains = hits[
-            ~hits['Name'].str.casefold().str.startswith(q)
-        ]
-
-        ordered = pd.concat([exact, starts, contains], ignore_index=True)
-        results.extend(
-            {'code': str(r.Code), 'name': str(r.Name)}
-            for r in ordered.itertuples(index=False)
-        )
-
-    # 중복 제거 + 최대 결과 수 제한
-    unique = []
-    seen = set()
-    for item in results:
-        code = str(item.get('code', '')).strip()
-        name = str(item.get('name', '')).strip()
-        key = code or name
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append({'code': code, 'name': name})
-        if len(unique) >= max_results:
-            break
-
-    return unique
-
-
-# ---------- 종목명 & 코드 정밀 매칭 ----------
-def get_code_and_name(query):
-    global krx_df
-    query = str(query or '').strip()
-
-    if query.isdigit() and len(query) == 6:
-        results = search_stock_list(query, max_results=1)
-        if results:
-            return results[0]['code'], results[0]['name']
-
-        code = query
-        try:
-            url = f"https://finance.naver.com/item/main.naver?code={code}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            name_elem = soup.select_one('.wrap_company h2 a')
-            if name_elem:
-                return code, name_elem.text.strip()
-        except Exception:
-            pass
-        return code, code
-
-    results = search_stock_list(query, max_results=1)
-    if results:
-        return results[0]['code'], results[0]['name']
-
-    return None, None
+    return pd.DataFrame(columns=['Code', 'Name'])
 
 
 # ---------- 네이버 월봉 가격 데이터 스크래핑 ----------
@@ -682,7 +576,7 @@ def calculate_multi_period_engine(code, name):
 # ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
     if code is None or name is None:
-        code, name = get_code_and_name(query)
+        code, name = query if isinstance(query, tuple) else (query, query)
     if not code:
         return None
 
@@ -705,45 +599,6 @@ def generate_v39_dashboard(query, code=None, name=None):
     w_div = data['w_div']
     w_growth = data['w_growth']
     profile_desc = data['profile_desc']
-
-    # IMPORTANT: 중첩 f-string + JavaScript 중괄호로 인한 SyntaxError 방지
-    matrix_rows = "".join(
-        f"""
-        <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
-            <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
-            <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
-            <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
-            <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
-            <td class="py-2.5 px-2.5 {('text-red-400 font-bold' if m['gap'] <= 0 else ('text-amber-400' if m['gap'] <= 3 else 'text-slate-300'))}">
-                {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
-            </td>
-            <td class="py-2.5 px-2.5 text-center">
-                <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
-            </td>
-        </tr>
-        """
-        for m in data['matrix']
-    )
-
-    news_html = "".join(
-        f"""
-        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-            <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
-        </a>
-        """
-        for n in news_items
-    ) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'
-
-    notice_html = "".join(
-        f"""
-        <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-            <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-            <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
-        </a>
-        """
-        for n in notice_items
-    ) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'
 
     html_content = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -858,8 +713,21 @@ def generate_v39_dashboard(query, code=None, name=None):
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800/60 font-medium cursor-pointer">
-                                    {matrix_rows}
-                    </tbody>
+                                    {"".join([f'''
+                                    <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
+                                        <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
+                                        <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
+                                        <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
+                                        <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
+                                        <td class="py-2.5 px-2.5 {'text-red-400 font-bold' if m['gap']<=0 else ('text-amber-400' if m['gap']<=3 else 'text-slate-300')}">
+                                            {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
+                                        </td>
+                                        <td class="py-2.5 px-2.5 text-center">
+                                            <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
+                                        </td>
+                                    </tr>
+                                    ''' for m in data['matrix']])}
+                                </tbody>
                             </table>
                         </div>
                     </div>
@@ -985,10 +853,20 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <button id="tabNoticeBtn" onclick="switchTab('notice')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition">📑 공시</button>
                 </div>
                 <div id="feedNews" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll">
-                    {news_html}
+                    {"".join([f'''
+                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+                        <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
+                    </a>
+                    ''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
                 </div>
                 <div id="feedNotice" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll hidden">
-                    {notice_html}
+                    {"".join([f'''
+                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
+                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
+                        <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
+                    </a>
+                    ''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
                 </div>
             </div>
 
@@ -1247,7 +1125,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.4 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.6 대시보드 렌더링 완료!")
     return html_content
 
 
@@ -1255,100 +1133,81 @@ def generate_v39_dashboard(query, code=None, name=None):
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-st.markdown(
-    "종목명, 일부 단어 또는 종목코드를 검색하세요. "
-    "**검색어가 종목명에 포함된 모든 종목을 찾아 선택할 수 있습니다.**"
-)
+st.markdown("종목명 또는 코드를 입력하세요. **검색어가 포함된 모든 종목이 리스트로 표시됩니다.**")
 
-user_query = st.text_input(
-    "🔎 종목 검색",
-    value="",
-    placeholder="예: 부동산 / 리츠 / 하이닉스 / 삼성 / 005930"
-).strip()
+user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스, 부동산, 맥쿼리)", value="")
 
 if user_query:
+    user_query = user_query.strip()
     selected_code = None
     selected_name = None
 
-    # 1) 6자리 종목코드
+    # 1) 6자리 숫자 코드 입력
     if user_query.isdigit() and len(user_query) == 6:
-        results = search_stock_list(user_query, max_results=10)
-        if results:
-            if len(results) == 1:
-                selected_code = results[0]['code']
-                selected_name = results[0]['name']
-            else:
-                options = [f"{x['name']} ({x['code']})" for x in results]
-                selected_option = st.selectbox("분석할 종목을 선택하세요", options, key="stock_selector")
-                idx = options.index(selected_option)
-                selected_code = results[idx]['code']
-                selected_name = results[idx]['name']
-        else:
-            # 코드가 KRX 목록에 없더라도 네이버에서 종목명을 확인
-            selected_code = user_query
-            try:
-                url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
-                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-                soup = BeautifulSoup(res.text, 'html.parser')
-                name_elem = soup.select_one('.wrap_company h2 a')
-                selected_name = name_elem.text.strip() if name_elem else None
-            except Exception:
-                selected_name = None
+        selected_code = user_query
+        # 종목명을 네이버에서 가져오기 시도
+        try:
+            url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            name_elem = soup.select_one('.wrap_company h2 a')
+            if name_elem:
+                selected_name = name_elem.text.strip()
+        except Exception:
+            pass
+        if selected_name is None:
+            selected_name = selected_code  # fallback
 
-            if not selected_name:
-                st.error("해당 종목코드를 찾지 못했습니다. 코드를 확인해주세요.")
-
-    # 2) 종목명/부분 검색
+    # 2) 종목명 또는 부분 검색어 -> 네이버 검색 API 우선 사용
     else:
-        search_results = search_stock_list(user_query, max_results=200)
-
-        if not search_results:
-            st.warning(
-                f"'{user_query}'가 종목명에 포함된 종목을 찾지 못했습니다. "
-                "다른 검색어를 입력해보세요."
-            )
+        # 2-1) 네이버 검색 API로 즉시 종목 리스트 가져오기
+        search_results = search_stock_list(user_query)
+        if search_results:
+            if len(search_results) == 1:
+                selected_code = search_results[0]["code"]
+                selected_name = search_results[0]["name"]
+            else:
+                st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
+                options = [f"{item['name']} ({item['code']})" for item in search_results]
+                selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
+                if selected_option:
+                    code_part = selected_option.split('(')[-1].rstrip(')')
+                    selected_code = code_part
+                    selected_name = selected_option.split(' (')[0]
         else:
-            st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
-            st.caption("종목명에 검색어가 포함된 종목을 모두 표시합니다. 아래에서 분석할 종목을 선택하세요.")
+            # 2-2) 네이버 검색 실패 시 전체 종목 리스트에서 검색
+            st.warning("네이버 검색에서 결과를 찾지 못해 전체 종목 리스트에서 검색합니다.")
+            stock_list_df = get_all_stock_list()
+            if not stock_list_df.empty:
+                matches = stock_list_df[stock_list_df['Name'].str.contains(user_query, case=False, na=False)]
+                if len(matches) == 0:
+                    st.error("일치하는 종목이 없습니다.")
+                elif len(matches) == 1:
+                    selected_code = matches.iloc[0]['Code']
+                    selected_name = matches.iloc[0]['Name']
+                else:
+                    st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(matches)}개)")
+                    options = [f"{row['Name']} ({row['Code']})" for _, row in matches.iterrows()]
+                    selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
+                    if selected_option:
+                        code_part = selected_option.split('(')[-1].rstrip(')')
+                        selected_code = code_part
+                        selected_name = selected_option.split(' (')[0]
+            else:
+                st.error("종목 검색에 실패했습니다. 네트워크 상태를 확인해주세요.")
 
-            options = [f"{item['name']}  |  {item['code']}" for item in search_results]
-            selected_option = st.selectbox(
-                "📌 분석할 종목 선택",
-                options,
-                key=f"stock_selector_{user_query}"
-            )
-
-            if selected_option:
-                selected_idx = options.index(selected_option)
-                selected_code = search_results[selected_idx]['code']
-                selected_name = search_results[selected_idx]['name']
-
-            # 검색 결과를 간단한 표로도 보여줘 선택 대상을 확인하기 쉽게 함
-            result_table = pd.DataFrame(search_results)
-            result_table.columns = ['종목코드', '종목명']
-            st.dataframe(
-                result_table,
-                use_container_width=True,
-                hide_index=True,
-                height=min(420, 35 * len(result_table) + 45)
-            )
-
-    # 3) 선택한 종목 분석
+    # 3) 분석 실행
     if selected_code and selected_name:
-        st.info(f"선택 종목: **{selected_name} ({selected_code})**")
-        if st.button("🚀 선택 종목 분석 실행", type="primary", use_container_width=True):
-            with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
-                try:
-                    html_str = generate_v39_dashboard(
-                        query=user_query,
-                        code=selected_code,
-                        name=selected_name
-                    )
-                    if html_str:
-                        st.components.v1.html(html_str, height=1200, scrolling=True)
-                    else:
-                        st.error("대시보드 생성에 실패했습니다.")
-                except Exception as e:
-                    logging.exception("대시보드 생성 오류")
-                    st.error(f"오류가 발생했습니다: {str(e)}")
-
+        with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+            try:
+                html_str = generate_v39_dashboard(
+                    query=user_query,
+                    code=selected_code,
+                    name=selected_name
+                )
+                if html_str:
+                    st.components.v1.html(html_str, height=1200, scrolling=True)
+                else:
+                    st.error("대시보드 생성에 실패했습니다.")
+            except Exception as e:
+                st.error(f"오류가 발생했습니다: {str(e)}")

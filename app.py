@@ -1,6 +1,6 @@
 # ============================================================
-# [v39.2] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
+# [v39.3] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 종목 검색 자동완성 리스트 + 다중 가격 데이터 소스 폴백
 # ============================================================
 
 import os
@@ -20,8 +20,6 @@ import streamlit.components.v1 as components
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-krx_df = None
-
 # ---------- 헬퍼 함수 ----------
 def _get_naver_monthly_price(code):
     """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
@@ -32,7 +30,6 @@ def _get_naver_monthly_price(code):
         res.encoding = 'cp949'
         soup = BeautifulSoup(res.text, 'html.parser')
         tables = pd.read_html(StringIO(res.text), encoding='cp949')
-        # 월봉 테이블은 보통 두 번째 테이블
         if tables:
             df = tables[0].copy()
             if '날짜' in df.columns:
@@ -45,7 +42,7 @@ def _get_naver_monthly_price(code):
                 df = df.apply(pd.to_numeric, errors='coerce')
                 df = df.sort_index()
                 return df
-    except Exception as e:
+    except Exception:
         pass
     return pd.DataFrame()
 
@@ -64,7 +61,7 @@ def get_price_data(code, name, start_date):
     except Exception as e:
         logging.warning(f"FinanceDataReader failed: {e}")
 
-    # 2) yfinance 직접 호출 (커스텀 세션 + 헤더)
+    # 2) yfinance 직접 호출
     for suffix in ['.KS', '.KQ']:
         try:
             ticker = f"{code}{suffix}"
@@ -80,7 +77,6 @@ def get_price_data(code, name, start_date):
     # 3) 네이버 금융 월봉 데이터
     df_naver = _get_naver_monthly_price(code)
     if not df_naver.empty:
-        # 최소 2년치 데이터만 사용 (월봉이므로)
         cutoff = datetime.today() - timedelta(days=365 * 11)
         df_naver = df_naver[df_naver.index >= cutoff]
         return df_naver
@@ -88,7 +84,19 @@ def get_price_data(code, name, start_date):
     return pd.DataFrame()
 
 
-# 2. 종목명 & 코드 정밀 매칭
+# ---------- 종목 리스트 캐싱 ----------
+@st.cache_data(ttl=3600)
+def load_krx_list():
+    try:
+        krx_df = fdr.StockListing('KRX')
+        if krx_df is not None and not krx_df.empty:
+            return krx_df[['Code', 'Name']].copy()
+    except Exception as e:
+        logging.warning(f"KRX 목록 로드 실패: {e}")
+    return pd.DataFrame(columns=['Code', 'Name'])
+
+
+# ---------- 종목명 & 코드 정밀 매칭 (내부용) ----------
 def get_code_and_name(query):
     global krx_df
     query = query.strip()
@@ -123,7 +131,7 @@ def get_code_and_name(query):
     return query, query
 
 
-# 3. 실제 DPS(주당배당금) 자동 크롤링 엔진
+# ---------- DPS 자동 크롤링 ----------
 def get_dps_automatically(code, name):
     for suffix in ['.KS', '.KQ']:
         try:
@@ -159,7 +167,7 @@ def get_dps_automatically(code, name):
     return 350.0
 
 
-# 4. 뉴스 및 공시 크롤링
+# ---------- 뉴스 및 공시 ----------
 def get_news_and_disclosures(code):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -216,7 +224,7 @@ def get_news_and_disclosures(code):
     return news_list, notice_list
 
 
-# 5. 오직 실제 재무 데이터만 수집 (더미데이터 원천 차단)
+# ---------- 실제 재무 데이터 수집 ----------
 def get_pure_real_fundamentals(code, name, df_price_full):
     is_etf = ('리츠' in name or 'TIGER' in name or 'KODEX' in name or 'ACE' in name or 'SOL' in name or '맥쿼리' in name)
     cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 19410.0
@@ -348,7 +356,7 @@ def get_pure_real_fundamentals(code, name, df_price_full):
     return fin_payload
 
 
-# 6. 종목 특성별 동적 가중치 산출 엔진
+# ---------- 동적 가중치 ----------
 def calculate_dynamic_weights(current_yield, growth_rate):
     w_div = 0.5
     w_growth = 0.5
@@ -370,17 +378,15 @@ def calculate_dynamic_weights(current_yield, growth_rate):
     return w_div, w_growth, profile_desc
 
 
-# 7. 다중 기간 연산 & 배당 밴드 + 종목 맞춤형 동적 가중치 융합 엔진
+# ---------- 다중 기간 연산 & 배당 밴드 ----------
 def calculate_multi_period_engine(code, name):
     now = datetime.today()
     start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
 
-    # 다중 소스 폴백을 통한 가격 데이터 수집
     df = get_price_data(code, name, start_date)
     if df.empty:
         raise ValueError("가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요.")
 
-    # 혹시 데이터가 너무 적으면(최소 3개월) 예외 처리
     if len(df) < 5:
         raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
 
@@ -390,7 +396,6 @@ def calculate_multi_period_engine(code, name):
 
     real_dps = get_dps_automatically(code, name)
 
-    # 2주 리샘플링 (이전과 동일)
     df_all = df.resample('2W').last().dropna()
     rolling_dps, rolling_yields = [], []
     for dt, row in df_all.iterrows():
@@ -486,11 +491,14 @@ def calculate_multi_period_engine(code, name):
     }
 
 
-# 8. GUI 렌더링 함수 (HTML 문자열 반환)
-def generate_v39_dashboard(query):
-    code, name = get_code_and_name(query)
+# ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
+def generate_v39_dashboard(query, code=None, name=None):
+    # code와 name이 명시적으로 제공되면 내부 해석 생략
+    if code is None or name is None:
+        code, name = get_code_and_name(query)
     if not code:
         return None
+
     data = calculate_multi_period_engine(code, name)
     if not data:
         return None
@@ -1036,23 +1044,87 @@ def generate_v39_dashboard(query):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.2 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.3 대시보드 렌더링 완료!")
     return html_content
 
 
-# 9. Streamlit 웹 화면 실행부
+# ---------- Streamlit UI ----------
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="005930")
+st.markdown("종목명 또는 코드를 입력하세요. 종목명은 부분 검색이 가능하며, 여러 결과가 나오면 선택할 수 있습니다.")
+
+krx_df = load_krx_list()  # 캐시된 종목 리스트
+
+user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스)", value="")
 
 if user_query:
-    with st.spinner('데이터를 수집하고 대시보드를 생성하는 중입니다...'):
-        try:
-            html_str = generate_v39_dashboard(user_query)
-            if html_str:
-                st.components.v1.html(html_str, height=1200, scrolling=True)
+    user_query = user_query.strip()
+    selected_code = None
+    selected_name = None
+
+    # 1) 6자리 숫자 코드 입력
+    if user_query.isdigit() and len(user_query) == 6:
+        selected_code = user_query
+        # 종목명이 리스트에 있으면 가져오고, 없으면 네이버에서 시도
+        if not krx_df.empty:
+            match = krx_df[krx_df['Code'] == selected_code]
+            if not match.empty:
+                selected_name = match.iloc[0]['Name']
+        if selected_name is None:
+            try:
+                url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
+                res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                name_elem = soup.select_one('.wrap_company h2 a')
+                if name_elem:
+                    selected_name = name_elem.text.strip()
+            except Exception:
+                pass
+        if selected_name is None:
+            selected_name = selected_code  # fallback
+
+    # 2) 종목명 부분 검색
+    else:
+        if not krx_df.empty:
+            # 2-1) 정확한 일치
+            exact = krx_df[krx_df['Name'] == user_query]
+            if not exact.empty:
+                selected_code = exact.iloc[0]['Code']
+                selected_name = exact.iloc[0]['Name']
             else:
-                st.error("데이터를 가져오지 못했습니다. 종목명 또는 코드를 확인해주세요.")
-        except Exception as e:
-            st.error(f"오류가 발생했습니다: {str(e)}")
+                # 2-2) 부분 일치 (포함)
+                partial = krx_df[krx_df['Name'].str.contains(user_query, case=False, na=False)]
+                if len(partial) == 0:
+                    st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
+                elif len(partial) == 1:
+                    selected_code = partial.iloc[0]['Code']
+                    selected_name = partial.iloc[0]['Name']
+                else:
+                    # 여러 종목이 검색되면 리스트로 표시
+                    st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(partial)}개)")
+                    options = [f"{row['Name']} ({row['Code']})" for _, row in partial.iterrows()]
+                    selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
+                    if selected_option:
+                        # 선택된 문자열에서 코드 추출
+                        code_part = selected_option.split('(')[-1].rstrip(')')
+                        selected_code = code_part
+                        selected_name = selected_option.split(' (')[0]
+        else:
+            st.warning("종목 리스트를 불러오지 못했습니다. 6자리 코드로만 검색 가능합니다.")
+
+    # 3) 분석 실행
+    if selected_code and selected_name:
+        with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+            try:
+                html_str = generate_v39_dashboard(
+                    query=user_query,
+                    code=selected_code,
+                    name=selected_name
+                )
+                if html_str:
+                    st.components.v1.html(html_str, height=1200, scrolling=True)
+                else:
+                    st.error("대시보드 생성에 실패했습니다.")
+            except Exception as e:
+                st.error(f"오류가 발생했습니다: {str(e)}")

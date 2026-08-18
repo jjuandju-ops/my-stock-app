@@ -1,5 +1,6 @@
 # ============================================================
-# [v39.1] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+# [v39.2] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
 
 import os
@@ -21,11 +22,77 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 krx_df = None
 
+# ---------- 헬퍼 함수 ----------
+def _get_naver_monthly_price(code):
+    """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
+    url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = 'cp949'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        tables = pd.read_html(StringIO(res.text), encoding='cp949')
+        # 월봉 테이블은 보통 두 번째 테이블
+        if tables:
+            df = tables[0].copy()
+            if '날짜' in df.columns:
+                df['날짜'] = pd.to_datetime(df['날짜'], format='%Y.%m.%d')
+                df = df.set_index('날짜')
+                df = df.rename(columns={
+                    '시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'
+                })
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                df = df.apply(pd.to_numeric, errors='coerce')
+                df = df.sort_index()
+                return df
+    except Exception as e:
+        pass
+    return pd.DataFrame()
+
+
+def get_price_data(code, name, start_date):
+    """
+    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
+    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
+    """
+    # 1) FinanceDataReader (Yahoo)
+    try:
+        df = fdr.DataReader(code, start=start_date)
+        if df is not None and not df.empty:
+            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+            return df
+    except Exception as e:
+        logging.warning(f"FinanceDataReader failed: {e}")
+
+    # 2) yfinance 직접 호출 (커스텀 세션 + 헤더)
+    for suffix in ['.KS', '.KQ']:
+        try:
+            ticker = f"{code}{suffix}"
+            yf_ticker = yf.Ticker(ticker)
+            df = yf_ticker.history(start=start_date, auto_adjust=False)
+            if df is not None and not df.empty:
+                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                df.index = df.index.tz_localize(None)
+                return df
+        except Exception as e:
+            logging.warning(f"yfinance failed for {ticker}: {e}")
+
+    # 3) 네이버 금융 월봉 데이터
+    df_naver = _get_naver_monthly_price(code)
+    if not df_naver.empty:
+        # 최소 2년치 데이터만 사용 (월봉이므로)
+        cutoff = datetime.today() - timedelta(days=365 * 11)
+        df_naver = df_naver[df_naver.index >= cutoff]
+        return df_naver
+
+    return pd.DataFrame()
+
+
 # 2. 종목명 & 코드 정밀 매칭
 def get_code_and_name(query):
     global krx_df
     query = query.strip()
-    
+
     if query.isdigit() and len(query) == 6:
         code = query
         try:
@@ -52,8 +119,9 @@ def get_code_and_name(query):
         partial = krx_df[krx_df['Name'].str.contains(query, case=False, na=False)]
         if not partial.empty:
             return partial.iloc[0]['Code'], partial.iloc[0]['Name']
-            
+
     return query, query
+
 
 # 3. 실제 DPS(주당배당금) 자동 크롤링 엔진
 def get_dps_automatically(code, name):
@@ -90,6 +158,7 @@ def get_dps_automatically(code, name):
         return 730.0
     return 350.0
 
+
 # 4. 뉴스 및 공시 크롤링
 def get_news_and_disclosures(code):
     headers = {
@@ -97,7 +166,7 @@ def get_news_and_disclosures(code):
         'Referer': f'https://finance.naver.com/item/main.naver?code={code}'
     }
     news_list, notice_list = [], []
-    
+
     try:
         url_news = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
         res = requests.get(url_news, headers=headers, timeout=5)
@@ -146,11 +215,12 @@ def get_news_and_disclosures(code):
 
     return news_list, notice_list
 
+
 # 5. 오직 실제 재무 데이터만 수집 (더미데이터 원천 차단)
 def get_pure_real_fundamentals(code, name, df_price_full):
     is_etf = ('리츠' in name or 'TIGER' in name or 'KODEX' in name or 'ACE' in name or 'SOL' in name or '맥쿼리' in name)
     cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 19410.0
-    
+
     fin_payload = {
         "is_etf": is_etf,
         "quarterly": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
@@ -158,7 +228,7 @@ def get_pure_real_fundamentals(code, name, df_price_full):
         "annual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
         "growth_model": {"est_per": 15.0, "growth_rate": 10.0, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
     }
-    
+
     if is_etf:
         return fin_payload
 
@@ -277,12 +347,9 @@ def get_pure_real_fundamentals(code, name, df_price_full):
     }
     return fin_payload
 
-# 6. [신규] 종목 특성별 동적 가중치(Dynamic Weighting) 산출 엔진
+
+# 6. 종목 특성별 동적 가중치 산출 엔진
 def calculate_dynamic_weights(current_yield, growth_rate):
-    """
-    종목의 배당수익률과 영업이익 성장률(YoY)을 기반으로
-    배당 가치 모델과 실적 성장(PEG) 모델의 최적 가중치를 동적으로 결정합니다.
-    """
     w_div = 0.5
     w_growth = 0.5
     profile_desc = "균형 성장/배당 믹스형"
@@ -299,30 +366,38 @@ def calculate_dynamic_weights(current_yield, growth_rate):
         w_div = 0.4
         w_growth = 0.6
         profile_desc = "배당성장 복합 체질"
-        
+
     return w_div, w_growth, profile_desc
+
 
 # 7. 다중 기간 연산 & 배당 밴드 + 종목 맞춤형 동적 가중치 융합 엔진
 def calculate_multi_period_engine(code, name):
     now = datetime.today()
     start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
-    df = fdr.DataReader(code, start=start_date)
+
+    # 다중 소스 폴백을 통한 가격 데이터 수집
+    df = get_price_data(code, name, start_date)
     if df.empty:
-        return None
-        
+        raise ValueError("가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요.")
+
+    # 혹시 데이터가 너무 적으면(최소 3개월) 예외 처리
+    if len(df) < 5:
+        raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
+
     latest_price = int(df['Close'].iloc[-1])
     prev_price = int(df['Close'].iloc[-2])
     change_pct = ((latest_price - prev_price) / prev_price) * 100
 
     real_dps = get_dps_automatically(code, name)
 
+    # 2주 리샘플링 (이전과 동일)
     df_all = df.resample('2W').last().dropna()
     rolling_dps, rolling_yields = [], []
     for dt, row in df_all.iterrows():
         p = float(row['Close'])
         rolling_dps.append(real_dps)
         rolling_yields.append((real_dps / p * 100) if p > 0 else 0.0)
-        
+
     df_all['DPS_TTM'] = rolling_dps
     df_all['Yield'] = rolling_yields
     current_yield = float(df_all['Yield'].iloc[-1])
@@ -340,7 +415,7 @@ def calculate_multi_period_engine(code, name):
         '5Y': ('5년 (장기 안전마진)', 5, '3차 매수'),
         '10Y': ('10년 (역사적 대바닥)', 10, '풀매수')
     }
-    
+
     matrix_table = []
     period_stats = {}
     for key, (label, yr, alloc) in periods_def.items():
@@ -373,10 +448,8 @@ def calculate_multi_period_engine(code, name):
     peg_bottom = gm['target_peg_05']
     growth_rate = gm['growth_rate']
 
-    # 종목별 맞춤형 동적 가중치 산출
     w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
 
-    # 동적 가중치를 적용한 3단계 융합 매수가 계산
     buy_step_1 = int(div_1y * w_div + peg_fair * w_growth)
     buy_step_2 = int(div_3y * w_div + (peg_fair * 0.6 + peg_bottom * 0.4) * w_growth)
     buy_step_3 = int(div_5y * w_div + peg_bottom * w_growth)
@@ -411,6 +484,7 @@ def calculate_multi_period_engine(code, name):
         "fin_data": fin_data,
         "chart_payload": chart_payload
     }
+
 
 # 8. GUI 렌더링 함수 (HTML 문자열 반환)
 def generate_v39_dashboard(query):
@@ -962,19 +1036,23 @@ def generate_v39_dashboard(query):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.1 대시보드 렌더링 완료!")
-    return html_content  # HTML 문자열 반환
+    print(f"✅ [{data['name']}] v39.2 대시보드 렌더링 완료!")
+    return html_content
+
 
 # 9. Streamlit 웹 화면 실행부
 st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
 
 st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="178920")
+user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="005930")
 
 if user_query:
     with st.spinner('데이터를 수집하고 대시보드를 생성하는 중입니다...'):
-        html_str = generate_v39_dashboard(user_query)
-        if html_str:
-            st.components.v1.html(html_str, height=1200, scrolling=True)
-        else:
-            st.error("데이터를 가져오지 못했습니다. 종목명 또는 코드를 확인해주세요.")
+        try:
+            html_str = generate_v39_dashboard(user_query)
+            if html_str:
+                st.components.v1.html(html_str, height=1200, scrolling=True)
+            else:
+                st.error("데이터를 가져오지 못했습니다. 종목명 또는 코드를 확인해주세요.")
+        except Exception as e:
+            st.error(f"오류가 발생했습니다: {str(e)}")

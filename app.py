@@ -2,9 +2,6 @@
 # [v39.0] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
 # ============================================================
 
-# 1. 필수 라이브러리 설치
-!pip install -q finance-datareader beautifulsoup4 lxml yfinance
-
 import os
 import re
 import json

@@ -1,7 +1,26 @@
 # ============================================================
-# [v39.5] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 종목명 부분 검색 시 전체 리스트 표시 (부동산, 하이닉스 등)
-#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
+# [v39.5] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델
+#         + KRX 전체 종목 부분일치 검색 강화 버전
+#
+# 핵심 변경사항
+# ------------------------------------------------------------
+# 1. 종목 검색을 네이버 자동완성 API에만 의존하지 않음
+# 2. FinanceDataReader KRX 전체 종목 목록을 이용한 부분일치 검색
+# 3. "부동산" 검색 시 종목명에 "부동산"이 들어가는 모든 종목 검색
+# 4. "리츠", "삼성", "하이닉스" 등도 부분 문자열 검색
+# 5. 검색 결과를 SelectBox로 선택
+# 6. 검색 결과 전체를 표로 표시
+# 7. 종목 선택 후 [분석 실행] 버튼을 눌러야 분석
+# 8. KRX 목록은 6시간 캐시
+# 9. 네이버 자동완성은 보조 검색원으로 사용
+# 10. 종목 검색 실패 시 기존처럼 바로 "일치하는 종목이
+#     없습니다"를 출력하지 않고 상세 안내
+#
+# 가격 데이터:
+# FinanceDataReader → yfinance → Naver 월봉
+#
+# 배당 데이터:
+# yfinance → Naver → 기본값
 # ============================================================
 
 import os
@@ -11,1155 +30,4164 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
+
 from io import StringIO
 from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+
 import yfinance as yf
 import FinanceDataReader as fdr
-from datetime import datetime, timedelta
+
 import streamlit as st
 import streamlit.components.v1 as components
 
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-# ---------- 전체 종목 리스트 로딩 (다중 소스 폴백) ----------
-@st.cache_data(ttl=3600)
-def get_all_stock_list():
+# ============================================================
+# 기본 설정
+# ============================================================
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+st.set_page_config(
+    layout="wide",
+    page_title="주식 융합 대시보드"
+)
+
+
+# ============================================================
+# 전역 변수
+# ============================================================
+
+krx_df = pd.DataFrame()
+
+
+# ============================================================
+# KRX 전체 종목 목록 로딩
+# ============================================================
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_krx_listing():
     """
-    전체 KRX 종목 리스트를 다양한 소스에서 순차적으로 가져온다.
-    Returns: DataFrame with columns ['Code', 'Name']
+    KRX 전체 종목 목록을 가져온다.
+
+    반환:
+        DataFrame
+        Code : 6자리 종목코드
+        Name : 종목명
+
+    FinanceDataReader 버전에 따라 컬럼이 달라질 수 있으므로
+    방어적으로 처리한다.
     """
-    # 1) FinanceDataReader
+
     try:
-        df = fdr.StockListing('KRX')
-        if df is not None and not df.empty and 'Code' in df.columns and 'Name' in df.columns:
-            return df[['Code', 'Name']].astype(str)
+        df = fdr.StockListing("KRX")
+
+        if df is None or df.empty:
+            logging.warning("KRX 종목 목록이 비어 있습니다.")
+            return pd.DataFrame(columns=["Code", "Name"])
+
+        if "Code" not in df.columns or "Name" not in df.columns:
+            logging.warning(
+                f"KRX 데이터에 Code/Name 컬럼이 없습니다. "
+                f"현재 컬럼: {list(df.columns)}"
+            )
+            return pd.DataFrame(columns=["Code", "Name"])
+
+        out = df[["Code", "Name"]].copy()
+
+        out.columns = ["Code", "Name"]
+
+        # 종목코드 정리
+        out["Code"] = (
+            out["Code"]
+            .astype(str)
+            .str.extract(r"(\d{6})", expand=False)
+        )
+
+        # 종목명 HTML 태그 제거
+        out["Name"] = (
+            out["Name"]
+            .astype(str)
+            .str.replace(r"<[^>]+>", "", regex=True)
+            .str.strip()
+        )
+
+        out = out.dropna(subset=["Code", "Name"])
+
+        out = out[
+            (out["Code"].str.len() == 6) &
+            (out["Name"] != "") &
+            (out["Name"].str.lower() != "nan")
+        ]
+
+        out = out.drop_duplicates(
+            subset=["Code"],
+            keep="first"
+        )
+
+        out = out.reset_index(drop=True)
+
+        logging.info(
+            f"KRX 종목 목록 로딩 완료: {len(out)}개"
+        )
+
+        return out
+
     except Exception as e:
-        logging.warning(f"fdr.StockListing failed: {e}")
 
-    # 2) pykrx
-    try:
-        from pykrx import stock
-        codes = stock.get_market_ticker_list(market="ALL")
-        names = [stock.get_market_ticker_name(c) for c in codes]
-        return pd.DataFrame({'Code': codes, 'Name': names})
-    except Exception as e:
-        logging.warning(f"pykrx failed: {e}")
+        logging.exception(
+            f"KRX 종목 목록 로딩 실패: {e}"
+        )
 
-    # 3) KRX 데이터 API (JSON)
-    try:
-        url = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
-        params = {
-            "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
-            "locale": "ko_KOR",
-            "mktId": "ALL",
-            "trdDd": datetime.today().strftime('%Y%m%d'),
-            "money": "1",
-            "csvxls_isNo": "false"
-        }
-        res = requests.post(url, data=params, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        data = res.json()
-        out = data.get('OutBlock_1', [])
-        df = pd.DataFrame(out)
-        if not df.empty and 'ISU_SRT_CD' in df.columns and 'ISU_ABBRV' in df.columns:
-            df = df.rename(columns={'ISU_SRT_CD': 'Code', 'ISU_ABBRV': 'Name'})
-            return df[['Code', 'Name']].astype(str)
-    except Exception as e:
-        logging.warning(f"KRX API failed: {e}")
-
-    # 4) 빈 DataFrame (폴백)
-    return pd.DataFrame(columns=['Code', 'Name'])
+        return pd.DataFrame(
+            columns=["Code", "Name"]
+        )
 
 
-# ---------- 네이버 금융 자동완성 검색 (보조) ----------
-def search_stock_list_naver(query):
+# ============================================================
+# 네이버 자동완성 검색
+# ============================================================
+
+def search_naver_autocomplete(query):
     """
-    네이버 금융 자동완성 API를 이용하여 검색어에 해당하는 종목 리스트를 반환한다.
-    Returns: list of dict [{"code": "000660", "name": "SK하이닉스"}]
+    네이버 금융 자동완성 API 검색.
+
+    네이버 검색이 실패해도 전체 검색은 중단하지 않는다.
     """
+
+    query = str(query or "").strip()
+
+    if not query:
+        return []
+
     url = "https://ac.finance.naver.com/ac"
+
     params = {
         "q": query,
         "target": "stock",
         "mode": "json"
     }
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/151.0.0.0 Safari/537.36"
+    }
+
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=5)
+
+        res = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=5
+        )
+
         res.raise_for_status()
+
         data = res.json()
-        items = data.get("items", [])
+
         result = []
+
+        items = data.get("items", [])
+
         for item in items:
-            if isinstance(item, list) and len(item) >= 2:
-                code = item[0]
-                name = item[1]
-                name = re.sub(r'<[^>]+>', '', name).strip()
-                result.append({"code": code, "name": name})
+
+            if not isinstance(item, list):
+                continue
+
+            if len(item) < 2:
+                continue
+
+            code = str(item[0]).strip()
+
+            name = re.sub(
+                r"<[^>]+>",
+                "",
+                str(item[1])
+            ).strip()
+
+            if not re.fullmatch(
+                r"\d{6}",
+                code
+            ):
+                continue
+
+            if not name:
+                continue
+
+            result.append(
+                {
+                    "code": code,
+                    "name": name
+                }
+            )
+
         return result
+
     except Exception as e:
-        logging.warning(f"네이버 자동완성 검색 실패: {e}")
+
+        logging.warning(
+            f"네이버 자동완성 검색 실패: {e}"
+        )
+
         return []
 
 
-# ---------- 네이버 월봉 가격 데이터 스크래핑 ----------
-def _get_naver_monthly_price(code):
-    """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
-    url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'cp949'
-        tables = pd.read_html(StringIO(res.text), encoding='cp949')
-        if tables:
-            df = tables[0].copy()
-            if '날짜' in df.columns:
-                df['날짜'] = pd.to_datetime(df['날짜'], format='%Y.%m.%d')
-                df = df.set_index('날짜')
-                df = df.rename(columns={
-                    '시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'
-                })
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df = df.apply(pd.to_numeric, errors='coerce')
-                df = df.sort_index()
-                return df
-    except Exception:
-        pass
-    return pd.DataFrame()
+# ============================================================
+# 종목 검색 통합 엔진
+# ============================================================
 
-
-# ---------- 가격 데이터 다중 소스 폴백 ----------
-def get_price_data(code, name, start_date):
+def search_stock_list(query, max_results=200):
     """
-    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
-    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
-    """
-    # 1) FinanceDataReader (Yahoo)
-    try:
-        df = fdr.DataReader(code, start=start_date)
-        if df is not None and not df.empty:
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-            return df
-    except Exception as e:
-        logging.warning(f"FinanceDataReader failed: {e}")
+    종목명 / 종목코드 통합 검색 엔진.
 
-    # 2) yfinance 직접 호출
-    for suffix in ['.KS', '.KQ']:
+    검색 원칙
+    --------------------------------------------------------
+    1. 숫자 6자리:
+       종목코드 검색
+
+    2. 문자:
+       KRX 전체 종목명에서 부분 문자열 검색
+
+    3. 네이버 자동완성:
+       KRX 검색을 보완
+
+    예:
+        부동산
+        리츠
+        삼성
+        하이닉스
+        반도체
+
+    모두 종목명에 해당 문자열이 포함된 종목을 검색한다.
+    """
+
+    query = str(query or "").strip()
+
+    if not query:
+        return []
+
+    # --------------------------------------------------------
+    # 숫자 종목코드 검색
+    # --------------------------------------------------------
+
+    if query.isdigit():
+
+        if len(query) > 6:
+            return []
+
+        qcode = query.zfill(6)
+
+        df = load_krx_listing()
+
+        if not df.empty:
+
+            hit = df[
+                df["Code"] == qcode
+            ]
+
+            if not hit.empty:
+
+                return [
+                    {
+                        "code": str(row.Code),
+                        "name": str(row.Name)
+                    }
+                    for row in hit.itertuples(index=False)
+                ]
+
+        # KRX 검색 실패 시 네이버 보완
+        return search_naver_autocomplete(qcode)
+
+    # --------------------------------------------------------
+    # 문자 검색
+    # --------------------------------------------------------
+
+    q = query.casefold()
+
+    results = []
+
+    # --------------------------------------------------------
+    # 1. 네이버 자동완성
+    # --------------------------------------------------------
+
+    naver_results = search_naver_autocomplete(query)
+
+    results.extend(naver_results)
+
+    # --------------------------------------------------------
+    # 2. KRX 전체 종목 검색
+    # --------------------------------------------------------
+
+    df = load_krx_listing()
+
+    if not df.empty:
+
+        names = (
+            df["Name"]
+            .astype(str)
+            .str.strip()
+        )
+
+        names_folded = names.str.casefold()
+
+        # 핵심:
+        # regex=False
+        #
+        # 따라서 검색어가 정규식으로 해석되지 않고
+        # 단순 문자열로 정확하게 포함 여부를 판단한다.
+        mask = names_folded.str.contains(
+            q,
+            regex=False,
+            na=False
+        )
+
+        hits = df.loc[
+            mask,
+            ["Code", "Name"]
+        ].copy()
+
+        if not hits.empty:
+
+            hit_names = (
+                hits["Name"]
+                .astype(str)
+                .str.casefold()
+            )
+
+            # 정확히 같은 종목명
+            exact = hits[
+                hit_names == q
+            ]
+
+            # 검색어로 시작하는 종목
+            starts = hits[
+                hit_names.str.startswith(q) &
+                (hit_names != q)
+            ]
+
+            # 검색어가 중간에 포함된 종목
+            contains = hits[
+                ~hit_names.str.startswith(q)
+            ]
+
+            ordered = pd.concat(
+                [
+                    exact,
+                    starts,
+                    contains
+                ],
+                ignore_index=True
+            )
+
+            for row in ordered.itertuples(
+                index=False
+            ):
+
+                results.append(
+                    {
+                        "code": str(row.Code),
+                        "name": str(row.Name)
+                    }
+                )
+
+    # --------------------------------------------------------
+    # 3. 중복 제거
+    # --------------------------------------------------------
+
+    unique = []
+
+    seen = set()
+
+    for item in results:
+
+        code = str(
+            item.get("code", "")
+        ).strip()
+
+        name = str(
+            item.get("name", "")
+        ).strip()
+
+        if not code or not name:
+            continue
+
+        key = code
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        unique.append(
+            {
+                "code": code,
+                "name": name
+            }
+        )
+
+        if len(unique) >= max_results:
+            break
+
+    return unique
+
+
+# ============================================================
+# 종목명 / 코드 정밀 매칭
+# ============================================================
+
+def get_code_and_name(query):
+
+    query = str(query or "").strip()
+
+    if not query:
+        return None, None
+
+    # --------------------------------------------------------
+    # 숫자 코드
+    # --------------------------------------------------------
+
+    if query.isdigit() and len(query) <= 6:
+
+        code = query.zfill(6)
+
+        results = search_stock_list(
+            code,
+            max_results=1
+        )
+
+        if results:
+
+            return (
+                results[0]["code"],
+                results[0]["name"]
+            )
+
+        # 네이버 직접 확인
         try:
-            ticker = f"{code}{suffix}"
-            yf_ticker = yf.Ticker(ticker)
-            df = yf_ticker.history(start=start_date, auto_adjust=False)
-            if df is not None and not df.empty:
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df.index = df.index.tz_localize(None)
-                return df
-        except Exception as e:
-            logging.warning(f"yfinance failed for {ticker}: {e}")
 
-    # 3) 네이버 금융 월봉 데이터
-    df_naver = _get_naver_monthly_price(code)
+            url = (
+                "https://finance.naver.com/"
+                f"item/main.naver?code={code}"
+            )
+
+            res = requests.get(
+                url,
+                headers={
+                    "User-Agent":
+                        "Mozilla/5.0"
+                },
+                timeout=5
+            )
+
+            soup = BeautifulSoup(
+                res.text,
+                "html.parser"
+            )
+
+            name_elem = soup.select_one(
+                ".wrap_company h2 a"
+            )
+
+            if name_elem:
+
+                return (
+                    code,
+                    name_elem.text.strip()
+                )
+
+        except Exception:
+            pass
+
+        return code, code
+
+    # --------------------------------------------------------
+    # 문자 검색
+    # --------------------------------------------------------
+
+    results = search_stock_list(
+        query,
+        max_results=1
+    )
+
+    if results:
+
+        return (
+            results[0]["code"],
+            results[0]["name"]
+        )
+
+    return None, None
+
+
+# ============================================================
+# 네이버 월봉 가격 데이터
+# ============================================================
+
+def _get_naver_monthly_price(code):
+    """
+    네이버 금융 월봉 데이터를 스크래핑한다.
+    """
+
+    url = (
+        "https://finance.naver.com/"
+        f"item/sise_month.nhn?code={code}"
+    )
+
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36"
+    }
+
+    try:
+
+        res = requests.get(
+            url,
+            headers=headers,
+            timeout=10
+        )
+
+        res.encoding = "cp949"
+
+        tables = pd.read_html(
+            StringIO(res.text)
+        )
+
+        if not tables:
+            return pd.DataFrame()
+
+        df = tables[0].copy()
+
+        if "날짜" not in df.columns:
+            return pd.DataFrame()
+
+        df["날짜"] = pd.to_datetime(
+            df["날짜"],
+            format="%Y.%m.%d",
+            errors="coerce"
+        )
+
+        df = df.dropna(
+            subset=["날짜"]
+        )
+
+        df = df.set_index("날짜")
+
+        df = df.rename(
+            columns={
+                "시가": "Open",
+                "고가": "High",
+                "저가": "Low",
+                "종가": "Close",
+                "거래량": "Volume"
+            }
+        )
+
+        required = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+
+        for col in required:
+
+            if col not in df.columns:
+                df[col] = np.nan
+
+        df = df[required]
+
+        df = df.apply(
+            pd.to_numeric,
+            errors="coerce"
+        )
+
+        df = df.dropna(
+            subset=["Close"]
+        )
+
+        df = df.sort_index()
+
+        return df
+
+    except Exception as e:
+
+        logging.warning(
+            f"네이버 월봉 데이터 실패: {e}"
+        )
+
+        return pd.DataFrame()
+
+
+# ============================================================
+# 가격 데이터 다중 소스 폴백
+# ============================================================
+
+def get_price_data(
+    code,
+    name,
+    start_date
+):
+    """
+    가격 데이터 수집 순서:
+
+    1. FinanceDataReader
+    2. yfinance
+    3. Naver 월봉
+    """
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    # --------------------------------------------------------
+    # 1. FinanceDataReader
+    # --------------------------------------------------------
+
+    try:
+
+        df = fdr.DataReader(
+            code,
+            start=start_date
+        )
+
+        if (
+            df is not None and
+            not df.empty
+        ):
+
+            for col in required:
+
+                if col not in df.columns:
+                    df[col] = np.nan
+
+            df = df[required]
+
+            df = df.apply(
+                pd.to_numeric,
+                errors="coerce"
+            )
+
+            df = df.dropna(
+                subset=["Close"]
+            )
+
+            return df
+
+    except Exception as e:
+
+        logging.warning(
+            f"FinanceDataReader 실패: {e}"
+        )
+
+    # --------------------------------------------------------
+    # 2. yfinance
+    # --------------------------------------------------------
+
+    for suffix in [".KS", ".KQ"]:
+
+        ticker = f"{code}{suffix}"
+
+        try:
+
+            yf_ticker = yf.Ticker(
+                ticker
+            )
+
+            df = yf_ticker.history(
+                start=start_date,
+                auto_adjust=False
+            )
+
+            if (
+                df is not None and
+                not df.empty
+            ):
+
+                for col in required:
+
+                    if col not in df.columns:
+                        df[col] = np.nan
+
+                df = df[required]
+
+                if hasattr(
+                    df.index,
+                    "tz"
+                ):
+
+                    if df.index.tz is not None:
+                        df.index = (
+                            df.index
+                            .tz_localize(None)
+                        )
+
+                df = df.apply(
+                    pd.to_numeric,
+                    errors="coerce"
+                )
+
+                df = df.dropna(
+                    subset=["Close"]
+                )
+
+                if not df.empty:
+                    return df
+
+        except Exception as e:
+
+            logging.warning(
+                f"yfinance 실패 "
+                f"{ticker}: {e}"
+            )
+
+    # --------------------------------------------------------
+    # 3. 네이버 월봉
+    # --------------------------------------------------------
+
+    df_naver = _get_naver_monthly_price(
+        code
+    )
+
     if not df_naver.empty:
-        cutoff = datetime.today() - timedelta(days=365 * 11)
-        df_naver = df_naver[df_naver.index >= cutoff]
+
+        cutoff = (
+            datetime.today()
+            - timedelta(days=365 * 11)
+        )
+
+        df_naver = df_naver[
+            df_naver.index >= cutoff
+        ]
+
         return df_naver
 
     return pd.DataFrame()
 
 
-# ---------- DPS 자동 크롤링 ----------
-def get_dps_automatically(code, name):
-    for suffix in ['.KS', '.KQ']:
+# ============================================================
+# DPS 자동 수집
+# ============================================================
+
+def get_dps_automatically(
+    code,
+    name
+):
+    """
+    최근 1년 DPS 자동 계산.
+
+    순서:
+        yfinance
+        →
+        Naver
+        →
+        종목 유형별 기본값
+    """
+
+    # --------------------------------------------------------
+    # 1. yfinance 배당
+    # --------------------------------------------------------
+
+    for suffix in [
+        ".KS",
+        ".KQ"
+    ]:
+
         try:
-            t = yf.Ticker(f"{code}{suffix}")
-            divs = t.dividends
-            if not divs.empty:
-                recent_divs = divs[divs.index >= (datetime.today() - timedelta(days=365))]
+
+            ticker = yf.Ticker(
+                f"{code}{suffix}"
+            )
+
+            divs = ticker.dividends
+
+            if (
+                divs is not None and
+                not divs.empty
+            ):
+
+                one_year_ago = (
+                    datetime.today()
+                    - timedelta(days=365)
+                )
+
+                # timezone 문제 방어
+                try:
+
+                    if divs.index.tz is not None:
+
+                        divs.index = (
+                            divs.index
+                            .tz_localize(None)
+                        )
+
+                except Exception:
+                    pass
+
+                recent_divs = divs[
+                    divs.index >= one_year_ago
+                ]
+
                 if not recent_divs.empty:
-                    dps_val = float(recent_divs.sum())
+
+                    dps_val = float(
+                        recent_divs.sum()
+                    )
+
                     if dps_val > 0:
+
                         return dps_val
+
         except Exception:
+
             continue
 
+    # --------------------------------------------------------
+    # 2. 네이버
+    # --------------------------------------------------------
+
     try:
-        url = f"https://finance.naver.com/item/main.naver?code={code}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for em in soup.find_all(['em', 'th', 'td']):
-            if '주당배당금' in em.text or '배당금' in em.text:
-                nxt = em.find_next_sibling()
-                if nxt:
-                    nums = re.findall(r'[\d,]+', nxt.text)
-                    if nums:
-                        val = float(nums[0].replace(',', ''))
-                        if val > 10:
+
+        url = (
+            "https://finance.naver.com/"
+            f"item/main.naver?code={code}"
+        )
+
+        res = requests.get(
+            url,
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0"
+            },
+            timeout=5
+        )
+
+        res.encoding = "cp949"
+
+        soup = BeautifulSoup(
+            res.text,
+            "html.parser"
+        )
+
+        # 우선 "주당배당금" 문구 탐색
+        text = soup.get_text(
+            " ",
+            strip=True
+        )
+
+        patterns = [
+            r"주당배당금\s*([0-9,]+)",
+            r"배당금\s*([0-9,]+)"
+        ]
+
+        for pattern in patterns:
+
+            matches = re.findall(
+                pattern,
+                text
+            )
+
+            if matches:
+
+                for value in matches:
+
+                    try:
+
+                        val = float(
+                            value.replace(",", "")
+                        )
+
+                        if val > 0:
                             return val
+
+                    except Exception:
+                        continue
+
+        # 기존 DOM 방식 보완
+        for elem in soup.find_all(
+            ["em", "th", "td"]
+        ):
+
+            if (
+                "주당배당금" in elem.text or
+                "배당금" in elem.text
+            ):
+
+                nxt = elem.find_next_sibling()
+
+                if nxt:
+
+                    nums = re.findall(
+                        r"[\d,]+",
+                        nxt.text
+                    )
+
+                    if nums:
+
+                        val = float(
+                            nums[0]
+                            .replace(",", "")
+                        )
+
+                        if val > 0:
+                            return val
+
     except Exception:
+
         pass
 
-    if '리츠' in name or '맥쿼리' in name:
+    # --------------------------------------------------------
+    # 3. 최소 기본값
+    # --------------------------------------------------------
+
+    if (
+        "리츠" in name or
+        "부동산" in name or
+        "맥쿼리" in name
+    ):
         return 730.0
+
     return 350.0
 
 
-# ---------- 뉴스 및 공시 ----------
+# ============================================================
+# 뉴스 및 공시
+# ============================================================
+
 def get_news_and_disclosures(code):
+
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': f'https://finance.naver.com/item/main.naver?code={code}'
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36",
+        "Referer":
+            f"https://finance.naver.com/item/main.naver?code={code}"
     }
-    news_list, notice_list = [], []
+
+    news_list = []
+    notice_list = []
+
+    # --------------------------------------------------------
+    # 뉴스
+    # --------------------------------------------------------
 
     try:
-        url_news = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
-        res = requests.get(url_news, headers=headers, timeout=5)
-        res.encoding = 'cp949'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for tr in soup.find_all('tr'):
-            a = tr.select_one('td.title a')
-            if not a:
-                continue
-            title = a.text.strip()
-            href = a.get('href', '')
-            link = f"https://finance.naver.com{href}" if href.startswith('/') else href
-            info_td = tr.select_one('td.info')
-            press = info_td.text.strip() if info_td else "네이버증권"
-            date_td = tr.select_one('td.date')
-            date_str = date_td.text.strip()[:10] if date_td else ""
-            tag = "배당" if any(k in title for k in ['배당', '분배', '주주']) else ("실적" if any(k in title for k in ['실적', '영업', '매출', '순익']) else "뉴스")
-            news_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(news_list) >= 10:
-                break
-    except Exception:
-        pass
+
+        url_news = (
+            "https://finance.naver.com/"
+            f"item/news_news.naver?code={code}&page=1"
+        )
+
+        res = requests.get(
+            url_news,
+            headers=headers,
+            timeout=10
+        )
+
+        res.encoding = "cp949"
+
+        soup = BeautifulSoup(
+            res.text,
+            "html.parser"
+        )
+
+        table = soup.select_one(
+            "table.type5"
+        )
+
+        if table:
+
+            for row in table.select("tr"):
+
+                title_elem = row.select_one(
+                    "a.tit"
+                )
+
+                if not title_elem:
+                    continue
+
+                title = title_elem.get_text(
+                    " ",
+                    strip=True
+                )
+
+                link = title_elem.get(
+                    "href",
+                    ""
+                )
+
+                if link.startswith("/"):
+                    link = (
+                        "https://finance.naver.com"
+                        + link
+                    )
+
+                info = row.select(
+                    "td"
+                )
+
+                press = ""
+
+                date = ""
+
+                if len(info) >= 2:
+
+                    press = info[-2].get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    date = info[-1].get_text(
+                        " ",
+                        strip=True
+                    )
+
+                news_list.append(
+                    {
+                        "tag": "NEWS",
+                        "title": title,
+                        "link": link,
+                        "press": press,
+                        "date": date
+                    }
+                )
+
+                if len(news_list) >= 15:
+                    break
+
+    except Exception as e:
+
+        logging.warning(
+            f"뉴스 수집 실패: {e}"
+        )
+
+    # --------------------------------------------------------
+    # 공시
+    # --------------------------------------------------------
 
     try:
-        url_notice = f"https://finance.naver.com/item/news_notice.naver?code={code}&page=1"
-        res = requests.get(url_notice, headers=headers, timeout=5)
-        res.encoding = 'cp949'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for tr in soup.find_all('tr'):
-            a = tr.select_one('td.title a')
-            if not a:
-                continue
-            title = a.text.strip()
-            href = a.get('href', '')
-            link = f"https://finance.naver.com{href}" if href.startswith('/') else href
-            info_td = tr.select_one('td.info')
-            press = info_td.text.strip() if info_td else "전자공시"
-            date_td = tr.select_one('td.date')
-            date_str = date_td.text.strip()[:10] if date_td else ""
-            tag = "배당공시" if any(k in title for k in ['배당', '분배', '주주총회']) else ("실적공시" if any(k in title for k in ['실적', '매출', '영업', '보고서']) else "공시")
-            notice_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(notice_list) >= 10:
-                break
-    except Exception:
-        pass
+
+        url_notice = (
+            "https://finance.naver.com/"
+            f"item/news_notice.naver?code={code}&page=1"
+        )
+
+        res = requests.get(
+            url_notice,
+            headers=headers,
+            timeout=10
+        )
+
+        res.encoding = "cp949"
+
+        soup = BeautifulSoup(
+            res.text,
+            "html.parser"
+        )
+
+        table = soup.select_one(
+            "table.type5"
+        )
+
+        if table:
+
+            for row in table.select("tr"):
+
+                title_elem = row.select_one(
+                    "a"
+                )
+
+                if not title_elem:
+                    continue
+
+                title = title_elem.get_text(
+                    " ",
+                    strip=True
+                )
+
+                link = title_elem.get(
+                    "href",
+                    ""
+                )
+
+                if link.startswith("/"):
+                    link = (
+                        "https://finance.naver.com"
+                        + link
+                    )
+
+                cells = row.select(
+                    "td"
+                )
+
+                press = ""
+                date = ""
+
+                if len(cells) >= 2:
+
+                    press = cells[-2].get_text(
+                        " ",
+                        strip=True
+                    )
+
+                    date = cells[-1].get_text(
+                        " ",
+                        strip=True
+                    )
+
+                notice_list.append(
+                    {
+                        "tag": "공시",
+                        "title": title,
+                        "link": link,
+                        "press": press,
+                        "date": date
+                    }
+                )
+
+                if len(notice_list) >= 15:
+                    break
+
+    except Exception as e:
+
+        logging.warning(
+            f"공시 수집 실패: {e}"
+        )
 
     return news_list, notice_list
 
 
-# ---------- 실제 재무 데이터 수집 ----------
-def get_pure_real_fundamentals(code, name, df_price_full):
-    is_etf = ('리츠' in name or 'TIGER' in name or 'KODEX' in name or 'ACE' in name or 'SOL' in name or '맥쿼리' in name)
-    cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 19410.0
+# ============================================================
+# 재무 / 성장 모델
+# ============================================================
 
-    fin_payload = {
-        "is_etf": is_etf,
-        "quarterly": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "semiannual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "annual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "growth_model": {"est_per": 15.0, "growth_rate": 10.0, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
+def get_financial_data(
+    code,
+    name
+):
+    """
+    재무 데이터.
+
+    Yahoo Finance를 우선 사용하고
+    실패하면 기본적인 안정값을 사용한다.
+    """
+
+    result = {
+        "growth_model": {
+            "growth_rate": 7.0,
+            "target_peg_10": 0.0,
+            "target_peg_05": 0.0
+        },
+        "financials": {}
     }
 
-    if is_etf:
-        return fin_payload
+    # --------------------------------------------------------
+    # yfinance
+    # --------------------------------------------------------
 
-    def get_closest_price(date_str):
+    for suffix in [
+        ".KS",
+        ".KQ"
+    ]:
+
         try:
-            clean_d = re.sub(r'[^\d.]', '', date_str).strip()
-            parts = clean_d.split('.')
-            target_dt = pd.to_datetime(f"{parts[0]}-{int(parts[1]):02d}-28") if len(parts) == 2 else pd.to_datetime(clean_d)
-            sub = df_price_full[df_price_full.index <= target_dt]
-            if not sub.empty:
-                return int(sub['Close'].iloc[-1])
-            return int(df_price_full['Close'].iloc[-1])
-        except Exception:
-            return int(df_price_full['Close'].iloc[-1])
 
-    q_dict = {}
+            ticker = yf.Ticker(
+                f"{code}{suffix}"
+            )
+
+            info = ticker.info
+
+            if not info:
+                continue
+
+            growth_rate = (
+                info.get(
+                    "earningsGrowth"
+                )
+            )
+
+            if growth_rate is None:
+
+                growth_rate = (
+                    info.get(
+                        "revenueGrowth"
+                    )
+                )
+
+            if growth_rate is not None:
+
+                growth_rate = (
+                    float(growth_rate)
+                    * 100
+                )
+
+            else:
+
+                growth_rate = 7.0
+
+            if (
+                not np.isfinite(
+                    growth_rate
+                )
+            ):
+
+                growth_rate = 7.0
+
+            growth_rate = max(
+                -20.0,
+                min(
+                    30.0,
+                    growth_rate
+                )
+            )
+
+            current_price = (
+                info.get(
+                    "currentPrice"
+                )
+                or info.get(
+                    "regularMarketPrice"
+                )
+                or 0
+            )
+
+            trailing_eps = (
+                info.get(
+                    "trailingEps"
+                )
+                or 0
+            )
+
+            if (
+                current_price and
+                trailing_eps and
+                trailing_eps > 0
+            ):
+
+                peg_fair = (
+                    trailing_eps
+                    * growth_rate
+                    * 1.0
+                )
+
+                peg_bottom = (
+                    trailing_eps
+                    * growth_rate
+                    * 0.7
+                )
+
+            else:
+
+                peg_fair = (
+                    float(current_price)
+                    if current_price
+                    else 0
+                )
+
+                peg_bottom = (
+                    peg_fair * 0.7
+                )
+
+            result["growth_model"] = {
+                "growth_rate":
+                    growth_rate,
+                "target_peg_10":
+                    peg_fair,
+                "target_peg_05":
+                    peg_bottom
+            }
+
+            result["financials"] = {
+                "market_cap":
+                    info.get(
+                        "marketCap",
+                        0
+                    ),
+                "trailing_eps":
+                    trailing_eps,
+                "current_price":
+                    current_price,
+                "pe_ratio":
+                    info.get(
+                        "trailingPE",
+                        0
+                    )
+            }
+
+            return result
+
+        except Exception as e:
+
+            logging.warning(
+                f"재무정보 수집 실패 "
+                f"{code}{suffix}: {e}"
+            )
+
+    return result
+
+
+# ============================================================
+# 동적 가중치
+# ============================================================
+
+def calculate_dynamic_weights(
+    current_yield,
+    growth_rate
+):
+    """
+    배당수익률과 성장률에 따라
+    배당 / 성장 가중치를 동적으로 결정한다.
+    """
+
     try:
-        for suffix in ['.KS', '.KQ']:
-            t = yf.Ticker(f"{code}{suffix}")
-            q_inc = t.quarterly_income_stmt
-            if q_inc is not None and not q_inc.empty:
-                for col in q_inc.columns:
-                    lbl = pd.to_datetime(col).strftime('%Y.%m')
-                    rev = float(q_inc.loc['Total Revenue', col] / 1e8) if 'Total Revenue' in q_inc.index and pd.notna(q_inc.loc['Total Revenue', col]) else 0.0
-                    prof = float(q_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in q_inc.index and pd.notna(q_inc.loc['Operating Income', col]) else 0.0
-                    net_m = [idx for idx in q_inc.index if 'Net Income' in str(idx)]
-                    net = float(q_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(q_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0:
-                        q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
-            if q_dict:
-                break
+        y = float(current_yield)
     except Exception:
-        pass
+        y = 0.0
 
-    if not q_dict:
-        try:
-            url = f"https://finance.naver.com/item/main.naver?code={code}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            tables = pd.read_html(StringIO(res.text), encoding='euc-kr')
-            for table in tables:
-                if isinstance(table.columns, pd.MultiIndex):
-                    t_idx = table.set_index(table.columns[0])
-                    q_cols = [c for c in table.columns if '분기' in str(c[0])]
-                    if q_cols:
-                        n_lbls = [str(c[1]).strip() for c in q_cols]
-                        def parse_n(kw):
-                            m = [i for i in t_idx.index if kw in str(i)]
-                            if m:
-                                row = t_idx.loc[m[0]][q_cols]
-                                return [float(re.sub(r'[^\d.-]', '', str(v))) if pd.notna(v) and re.sub(r'[^\d.-]', '', str(v)) not in ['', '-', '.'] else 0.0 for v in row]
-                            return [0.0] * len(q_cols)
-                        n_rev, n_prof, n_net = parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')
-                        for l, r, p, n in zip(n_lbls, n_rev, n_prof, n_net):
-                            clean_l = l.replace('(E)', '').strip()
-                            if r > 0 or p != 0:
-                                q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
-                    break
-        except Exception:
-            pass
+    try:
+        g = float(growth_rate)
+    except Exception:
+        g = 0.0
 
-    if not q_dict:
-        return fin_payload
+    # 기본
+    w_div = 0.60
+    w_growth = 0.40
 
-    sorted_q = sorted(q_dict.keys())
-    q_labels, q_rev, q_prof, q_net, q_opm, q_prices, q_growth_yoy = [], [], [], [], [], [], []
-    for idx, k in enumerate(sorted_q):
-        r, p, n = q_dict[k]["revenue"], q_dict[k]["profit"], q_dict[k]["net"]
-        q_labels.append(k)
-        q_rev.append(r)
-        q_prof.append(p)
-        q_net.append(n)
-        q_opm.append(round((p / r * 100), 1) if r > 0 else 0.0)
-        q_prices.append(get_closest_price(k))
-        if idx >= 4:
-            prev_p = q_dict[sorted_q[idx-4]]["profit"]
-            yoy = round(((p - prev_p) / abs(prev_p) * 100), 1) if prev_p != 0 else 0.0
-        else:
-            yoy = 10.0
-        q_growth_yoy.append(yoy)
+    # 고배당
+    if y >= 7.0:
 
-    fin_payload["quarterly"] = {
-        "labels": q_labels,
-        "profit": q_prof,
-        "revenue": q_rev,
-        "net": q_net,
-        "opm": q_opm,
-        "prices": q_prices,
-        "growth_yoy": q_growth_yoy
-    }
-    fin_payload["semiannual"] = {
-        "labels": q_labels[::2],
-        "profit": q_prof[::2],
-        "revenue": q_rev[::2],
-        "net": q_net[::2],
-        "opm": q_opm[::2],
-        "prices": q_prices[::2],
-        "growth_yoy": q_growth_yoy[::2]
-    }
-    fin_payload["annual"] = {
-        "labels": [l[:4] + "년" for l in q_labels[::4]],
-        "profit": q_prof[::4],
-        "revenue": q_rev[::4],
-        "net": q_net[::4],
-        "opm": q_opm[::4],
-        "prices": q_prices[::4],
-        "growth_yoy": q_growth_yoy[::4]
-    }
+        w_div = 0.75
+        w_growth = 0.25
 
-    recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
-    fin_payload["growth_model"] = {
-        "est_per": 15.0,
-        "growth_rate": recent_yoy,
-        "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8),
-        "target_peg_10": int(cur_price * 1.05)
-    }
-    return fin_payload
+        profile = (
+            "고배당형"
+        )
+
+    elif y >= 5.0:
+
+        w_div = 0.70
+        w_growth = 0.30
+
+        profile = (
+            "배당중심형"
+        )
+
+    elif y >= 3.0:
+
+        w_div = 0.60
+        w_growth = 0.40
+
+        profile = (
+            "균형형"
+        )
+
+    elif g >= 12.0:
+
+        w_div = 0.40
+        w_growth = 0.60
+
+        profile = (
+            "성장중심형"
+        )
+
+    else:
+
+        w_div = 0.50
+        w_growth = 0.50
+
+        profile = (
+            "중립형"
+        )
+
+    return (
+        w_div,
+        w_growth,
+        profile
+    )
 
 
-# ---------- 동적 가중치 ----------
-def calculate_dynamic_weights(current_yield, growth_rate):
-    w_div = 0.5
-    w_growth = 0.5
-    profile_desc = "균형 성장/배당 믹스형"
+# ============================================================
+# 종합 데이터 계산
+# ============================================================
 
-    if current_yield >= 5.0 and growth_rate < 10.0:
-        w_div = 0.8
-        w_growth = 0.2
-        profile_desc = "고배당 안정형 체질"
-    elif current_yield < 1.5 and growth_rate >= 20.0:
-        w_div = 0.2
-        w_growth = 0.8
-        profile_desc = "고성장 모멘텀형 체질"
-    elif current_yield >= 3.0 and growth_rate >= 15.0:
-        w_div = 0.4
-        w_growth = 0.6
-        profile_desc = "배당성장 복합 체질"
+def calculate_multi_period_engine(
+    code,
+    name
+):
 
-    return w_div, w_growth, profile_desc
+    now = datetime.now()
 
+    start_date = (
+        now
+        - timedelta(days=365 * 11)
+    )
 
-# ---------- 다중 기간 연산 & 배당 밴드 ----------
-def calculate_multi_period_engine(code, name):
-    now = datetime.today()
-    start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
+    # --------------------------------------------------------
+    # 가격 데이터
+    # --------------------------------------------------------
 
-    df = get_price_data(code, name, start_date)
-    if df.empty:
-        raise ValueError("가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요.")
+    df = get_price_data(
+        code,
+        name,
+        start_date
+    )
+
+    if df is None or df.empty:
+
+        raise ValueError(
+            "가격 데이터를 가져오지 못했습니다. "
+            "네트워크 상태를 확인하거나 "
+            "종목 코드를 확인해주세요."
+        )
 
     if len(df) < 5:
-        raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
 
-    latest_price = int(df['Close'].iloc[-1])
-    prev_price = int(df['Close'].iloc[-2])
-    change_pct = ((latest_price - prev_price) / prev_price) * 100
+        raise ValueError(
+            "충분한 가격 데이터를 "
+            "확보하지 못했습니다."
+        )
 
-    real_dps = get_dps_automatically(code, name)
+    df = df.copy()
 
-    df_all = df.resample('2W').last().dropna()
-    rolling_dps, rolling_yields = [], []
+    df = df.sort_index()
+
+    df["Close"] = pd.to_numeric(
+        df["Close"],
+        errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["Close"]
+    )
+
+    if len(df) < 5:
+
+        raise ValueError(
+            "유효한 종가 데이터가 "
+            "충분하지 않습니다."
+        )
+
+    # --------------------------------------------------------
+    # 최신 가격
+    # --------------------------------------------------------
+
+    latest_price = int(
+        round(
+            float(
+                df["Close"].iloc[-1]
+            )
+        )
+    )
+
+    prev_price = int(
+        round(
+            float(
+                df["Close"].iloc[-2]
+            )
+        )
+    )
+
+    if prev_price > 0:
+
+        change_pct = (
+            (
+                latest_price
+                - prev_price
+            )
+            / prev_price
+            * 100
+        )
+
+    else:
+
+        change_pct = 0.0
+
+    # --------------------------------------------------------
+    # DPS
+    # --------------------------------------------------------
+
+    real_dps = get_dps_automatically(
+        code,
+        name
+    )
+
+    if real_dps <= 0:
+        real_dps = 350.0
+
+    # --------------------------------------------------------
+    # 2주 단위 데이터
+    # --------------------------------------------------------
+
+    df_all = (
+        df
+        .resample("2W")
+        .last()
+        .dropna(
+            subset=["Close"]
+        )
+    )
+
+    if df_all.empty:
+
+        df_all = df.copy()
+
+    rolling_dps = []
+
+    rolling_yields = []
+
     for dt, row in df_all.iterrows():
-        p = float(row['Close'])
-        rolling_dps.append(real_dps)
-        rolling_yields.append((real_dps / p * 100) if p > 0 else 0.0)
 
-    df_all['DPS_TTM'] = rolling_dps
-    df_all['Yield'] = rolling_yields
-    current_yield = float(df_all['Yield'].iloc[-1])
+        p = float(
+            row["Close"]
+        )
 
-    close_all = df_all['Close']
+        rolling_dps.append(
+            real_dps
+        )
+
+        if p > 0:
+
+            rolling_yields.append(
+                real_dps
+                / p
+                * 100
+            )
+
+        else:
+
+            rolling_yields.append(
+                0.0
+            )
+
+    df_all["DPS_TTM"] = (
+        rolling_dps
+    )
+
+    df_all["Yield"] = (
+        rolling_yields
+    )
+
+    current_yield = float(
+        df_all["Yield"].iloc[-1]
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    close_all = df_all["Close"]
+
     delta = close_all.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+
+    gain = (
+        delta
+        .where(
+            delta > 0,
+            0
+        )
+        .rolling(14)
+        .mean()
+    )
+
+    loss = (
+        -delta
+        .where(
+            delta < 0,
+            0
+        )
+        .rolling(14)
+        .mean()
+    )
+
     rs = gain / loss
-    df_all['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
+
+    df_all["RSI"] = (
+        100
+        - (
+            100
+            / (1 + rs)
+        )
+    )
+
+    df_all["RSI"] = (
+        df_all["RSI"]
+        .replace(
+            [np.inf, -np.inf],
+            np.nan
+        )
+        .fillna(50)
+    )
+
+    # --------------------------------------------------------
+    # 기간별 배당수익률
+    # --------------------------------------------------------
 
     periods_def = {
-        '1Y': ('1년 (단기 바닥)', 1, '1차 매수'),
-        '3Y': ('3년 (중기 바닥)', 3, '2차 매수'),
-        '5Y': ('5년 (장기 안전마진)', 5, '3차 매수'),
-        '10Y': ('10년 (역사적 대바닥)', 10, '풀매수')
+        "1Y": (
+            "1년 (단기 바닥)",
+            1,
+            "1차 매수"
+        ),
+        "3Y": (
+            "3년 (중기 바닥)",
+            3,
+            "2차 매수"
+        ),
+        "5Y": (
+            "5년 (장기 안전마진)",
+            5,
+            "3차 매수"
+        ),
+        "10Y": (
+            "10년 (역사적 대바닥)",
+            10,
+            "풀매수"
+        )
     }
 
     matrix_table = []
+
     period_stats = {}
-    for key, (label, yr, alloc) in periods_def.items():
-        sub_df = df_all[df_all.index >= now - timedelta(days=365 * yr)]
+
+    for key, (
+        label,
+        years,
+        allocation
+    ) in periods_def.items():
+
+        sub_df = df_all[
+            df_all.index
+            >= now
+            - timedelta(
+                days=365 * years
+            )
+        ]
+
         if sub_df.empty:
+
             sub_df = df_all
-        p_max_yield = float(np.max(sub_df['Yield'])) if not sub_df.empty else 3.67
-        floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
-        gap = ((latest_price - floor_price) / floor_price) * 100
-        matrix_table.append({
-            "key": key,
-            "period": label,
-            "allocation": alloc,
-            "max_yield": p_max_yield,
-            "floor_price": floor_price,
-            "gap": gap,
-            "diff_won": latest_price - floor_price,
-            "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
-            "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
-        })
-        period_stats[key] = {"max_yield": p_max_yield, "floor_price": floor_price}
 
-    fin_data = get_pure_real_fundamentals(code, name, df)
-    gm = fin_data['growth_model']
+        if not sub_df.empty:
 
-    div_1y = matrix_table[0]['floor_price']
-    div_3y = matrix_table[1]['floor_price']
-    div_5y = matrix_table[2]['floor_price']
-    peg_fair = gm['target_peg_10']
-    peg_bottom = gm['target_peg_05']
-    growth_rate = gm['growth_rate']
+            p_max_yield = float(
+                np.max(
+                    sub_df["Yield"]
+                )
+            )
 
-    w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
+            p_min_yield = float(
+                np.min(
+                    sub_df["Yield"]
+                )
+            )
 
-    buy_step_1 = int(div_1y * w_div + peg_fair * w_growth)
-    buy_step_2 = int(div_3y * w_div + (peg_fair * 0.6 + peg_bottom * 0.4) * w_growth)
-    buy_step_3 = int(div_5y * w_div + peg_bottom * w_growth)
+            p_avg_yield = float(
+                np.mean(
+                    sub_df["Yield"]
+                )
+            )
+
+        else:
+
+            p_max_yield = 3.67
+            p_min_yield = 0.0
+            p_avg_yield = 0.0
+
+        if p_max_yield > 0:
+
+            floor_price = int(
+                real_dps
+                / (
+                    p_max_yield
+                    / 100
+                )
+            )
+
+        else:
+
+            floor_price = 0
+
+        if floor_price > 0:
+
+            gap = (
+                (
+                    latest_price
+                    - floor_price
+                )
+                / floor_price
+                * 100
+            )
+
+        else:
+
+            gap = 0.0
+
+        diff_won = (
+            latest_price
+            - floor_price
+        )
+
+        status = (
+            "🎯 매수 가능"
+            if latest_price <= floor_price
+            else "⏳ 대기 (비쌈)"
+        )
+
+        matrix_table.append(
+            {
+                "key": key,
+                "period": label,
+                "allocation": allocation,
+                "max_yield": p_max_yield,
+                "floor_price": floor_price,
+                "gap": gap,
+                "diff_won": diff_won,
+                "status": status
+            }
+        )
+
+        period_stats[key] = {
+            "min_yield":
+                p_min_yield,
+            "avg_yield":
+                p_avg_yield,
+            "max_yield":
+                p_max_yield
+        }
+
+    # --------------------------------------------------------
+    # 성장 모델
+    # --------------------------------------------------------
+
+    fin_data = get_financial_data(
+        code,
+        name
+    )
+
+    gm = fin_data[
+        "growth_model"
+    ]
+
+    growth_rate = float(
+        gm.get(
+            "growth_rate",
+            7.0
+        )
+    )
+
+    peg_fair = float(
+        gm.get(
+            "target_peg_10",
+            latest_price
+        )
+    )
+
+    peg_bottom = float(
+        gm.get(
+            "target_peg_05",
+            latest_price * 0.7
+        )
+    )
+
+    # PEG 가격이 0 또는 비정상일 경우
+    if (
+        not np.isfinite(
+            peg_fair
+        )
+        or peg_fair <= 0
+    ):
+
+        peg_fair = float(
+            latest_price
+        )
+
+    if (
+        not np.isfinite(
+            peg_bottom
+        )
+        or peg_bottom <= 0
+    ):
+
+        peg_bottom = (
+            latest_price * 0.7
+        )
+
+    # --------------------------------------------------------
+    # 동적 가중치
+    # --------------------------------------------------------
+
+    (
+        w_div,
+        w_growth,
+        profile_desc
+    ) = calculate_dynamic_weights(
+        current_yield,
+        growth_rate
+    )
+
+    # --------------------------------------------------------
+    # 매수 가격
+    # --------------------------------------------------------
+
+    div_1y = (
+        matrix_table[0]["floor_price"]
+    )
+
+    div_3y = (
+        matrix_table[1]["floor_price"]
+    )
+
+    div_5y = (
+        matrix_table[2]["floor_price"]
+    )
+
+    if div_1y <= 0:
+        div_1y = latest_price
+
+    if div_3y <= 0:
+        div_3y = latest_price
+
+    if div_5y <= 0:
+        div_5y = latest_price
+
+    buy_step_1 = int(
+        div_1y * w_div
+        + peg_fair * w_growth
+    )
+
+    buy_step_2 = int(
+        div_3y * w_div
+        + (
+            peg_fair * 0.6
+            + peg_bottom * 0.4
+        )
+        * w_growth
+    )
+
+    buy_step_3 = int(
+        div_5y * w_div
+        + peg_bottom * w_growth
+    )
+
+    # --------------------------------------------------------
+    # 차트 데이터
+    # --------------------------------------------------------
 
     chart_payload = {
-        "dates": df_all.index.strftime('%y.%m.%d').tolist(),
-        "prices": df_all['Close'].astype(int).tolist(),
-        "yields": [round(float(v), 2) for v in df_all['Yield']],
-        "rsis": [round(float(v), 1) for v in df_all['RSI']],
-        "dps": df_all['DPS_TTM'].tolist(),
-        "stats": period_stats
+        "dates":
+            df_all.index
+            .strftime("%y.%m.%d")
+            .tolist(),
+
+        "prices":
+            df_all["Close"]
+            .fillna(0)
+            .astype(int)
+            .tolist(),
+
+        "yields":
+            [
+                round(
+                    float(v),
+                    2
+                )
+                for v
+                in df_all["Yield"]
+            ],
+
+        "rsis":
+            [
+                round(
+                    float(v),
+                    1
+                )
+                for v
+                in df_all["RSI"]
+            ],
+
+        "dps":
+            [
+                round(
+                    float(v),
+                    2
+                )
+                for v
+                in df_all["DPS_TTM"]
+            ],
+
+        "stats":
+            period_stats
     }
 
     return {
         "code": code,
         "name": name,
-        "latest_price": latest_price,
-        "change_pct": change_pct,
-        "current_yield": current_yield,
-        "current_dps": real_dps,
-        "matrix": matrix_table,
-        "buy_step_1": buy_step_1,
-        "buy_step_2": buy_step_2,
-        "buy_step_3": buy_step_3,
-        "div_1y": div_1y,
-        "div_5y": div_5y,
-        "peg_fair": peg_fair,
-        "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100),
-        "w_growth": int(w_growth * 100),
-        "profile_desc": profile_desc,
-        "fin_data": fin_data,
-        "chart_payload": chart_payload
+
+        "latest_price":
+            latest_price,
+
+        "change_pct":
+            change_pct,
+
+        "current_yield":
+            current_yield,
+
+        "current_dps":
+            real_dps,
+
+        "matrix":
+            matrix_table,
+
+        "buy_step_1":
+            buy_step_1,
+
+        "buy_step_2":
+            buy_step_2,
+
+        "buy_step_3":
+            buy_step_3,
+
+        "div_1y":
+            div_1y,
+
+        "div_5y":
+            div_5y,
+
+        "peg_fair":
+            peg_fair,
+
+        "peg_bottom":
+            peg_bottom,
+
+        "w_div":
+            int(w_div * 100),
+
+        "w_growth":
+            int(w_growth * 100),
+
+        "profile_desc":
+            profile_desc,
+
+        "fin_data":
+            fin_data,
+
+        "chart_payload":
+            chart_payload
     }
 
 
-# ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
-def generate_v39_dashboard(query, code=None, name=None):
+# ============================================================
+# HTML 대시보드 생성
+# ============================================================
+
+def generate_v39_dashboard(
+    query,
+    code=None,
+    name=None
+):
+
     if code is None or name is None:
-        code, name = get_code_and_name(query)
-    if not code:
+
+        code, name = get_code_and_name(
+            query
+        )
+
+    if not code or not name:
+
         return None
 
-    data = calculate_multi_period_engine(code, name)
+    data = calculate_multi_period_engine(
+        code,
+        name
+    )
+
     if not data:
+
         return None
 
-    news_items, notice_items = get_news_and_disclosures(code)
-    fin = data['fin_data']
-    gm = fin.get('growth_model', {})
-    file_name = f"dividend_dashboard_{code}.html"
+    news_items, notice_items = (
+        get_news_and_disclosures(
+            code
+        )
+    )
 
-    b1 = data['buy_step_1']
-    b2 = data['buy_step_2']
-    b3 = data['buy_step_3']
-    div_1y = data['div_1y']
-    div_5y = data['div_5y']
-    peg_fair = data['peg_fair']
-    peg_bottom = data['peg_bottom']
-    w_div = data['w_div']
-    w_growth = data['w_growth']
-    profile_desc = data['profile_desc']
+    fin = data["fin_data"]
 
-    html_content = f"""<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>[{code}] {data['name']} 종목 맞춤형 동적 가중치 대시보드</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700;800&display=swap');
-        body {{ font-family: 'Pretendard', sans-serif; background-color: #0b0f19; color: #f1f5f9; }}
-        .custom-scroll::-webkit-scrollbar {{ width: 5px; }}
-        .custom-scroll::-webkit-scrollbar-track {{ background: #111827; }}
-        .custom-scroll::-webkit-scrollbar-thumb {{ background: #374151; border-radius: 3px; }}
-    </style>
-</head>
-<body class="p-3 md:p-6 custom-scroll">
-    <div class="max-w-6xl mx-auto space-y-4">
-        
-        <!-- 상단 헤더 -->
-        <div class="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-2xl backdrop-blur-md flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div>
-                <div class="flex items-center gap-3">
-                    <h1 class="text-2xl font-extrabold text-white tracking-tight">{data['name']}</h1>
-                    <span class="text-xs px-2.5 py-1 bg-slate-800 text-blue-400 font-mono rounded-lg border border-slate-700">{code}</span>
-                    <span class="text-xs px-3 py-1 bg-indigo-950 text-indigo-300 font-bold rounded-lg border border-indigo-800">
-                        {profile_desc} (배당 {w_div}% : 성장 {w_growth}%)
+    gm = fin.get(
+        "growth_model",
+        {}
+    )
+
+    file_name = (
+        f"dividend_dashboard_{code}.html"
+    )
+
+    b1 = data["buy_step_1"]
+    b2 = data["buy_step_2"]
+    b3 = data["buy_step_3"]
+
+    div_1y = data["div_1y"]
+    div_5y = data["div_5y"]
+
+    peg_fair = data["peg_fair"]
+    peg_bottom = data["peg_bottom"]
+
+    w_div = data["w_div"]
+    w_growth = data["w_growth"]
+
+    profile_desc = data[
+        "profile_desc"
+    ]
+
+    matrix = data["matrix"]
+
+    chart_payload_json = json.dumps(
+        data["chart_payload"],
+        ensure_ascii=False
+    )
+
+    # --------------------------------------------------------
+    # 기간별 카드
+    # --------------------------------------------------------
+
+    matrix_cards = ""
+
+    for item in matrix:
+
+        status_class = (
+            "text-emerald-400"
+            if "매수 가능"
+            in item["status"]
+            else "text-amber-400"
+        )
+
+        matrix_cards += f"""
+        <div class="bg-slate-950/70
+                    p-4 rounded-xl
+                    border border-slate-800">
+
+            <div class="flex items-center
+                        justify-between mb-2">
+
+                <span class="text-sm
+                             font-black
+                             text-white">
+                    {item['period']}
+                </span>
+
+                <span class="text-xs
+                             font-bold
+                             {status_class}">
+                    {item['status']}
+                </span>
+
+            </div>
+
+            <div class="grid grid-cols-2 gap-2">
+
+                <div>
+                    <p class="text-[10px]
+                              text-slate-500">
+                        최대 배당률
+                    </p>
+
+                    <p class="text-sm
+                              font-bold
+                              text-blue-300">
+                        {item['max_yield']:.2f}%
+                    </p>
+                </div>
+
+                <div>
+                    <p class="text-[10px]
+                              text-slate-500">
+                        바닥 가격
+                    </p>
+
+                    <p class="text-sm
+                              font-bold
+                              text-white">
+                        {item['floor_price']:,}원
+                    </p>
+                </div>
+
+                <div>
+                    <p class="text-[10px]
+                              text-slate-500">
+                        현재가 차이
+                    </p>
+
+                    <p class="text-sm
+                              font-bold
+                              text-slate-200">
+                        {item['diff_won']:+,}원
+                    </p>
+                </div>
+
+                <div>
+                    <p class="text-[10px]
+                              text-slate-500">
+                        괴리율
+                    </p>
+
+                    <p class="text-sm
+                              font-bold
+                              text-slate-200">
+                        {item['gap']:+.2f}%
+                    </p>
+                </div>
+
+            </div>
+        </div>
+        """
+
+    # --------------------------------------------------------
+    # 뉴스 HTML
+    # --------------------------------------------------------
+
+    news_html = ""
+
+    if news_items:
+
+        for n in news_items:
+
+            news_html += f"""
+            <a href="{n['link']}"
+               target="_blank"
+               class="block p-3
+                      bg-slate-950/60
+                      hover:bg-slate-950
+                      rounded-xl
+                      border border-slate-800/80
+                      transition">
+
+                <div class="flex
+                            items-center
+                            justify-between
+                            gap-1
+                            mb-1.5">
+
+                    <span class="px-2 py-0.5
+                                 text-[9px]
+                                 font-bold
+                                 rounded
+                                 bg-blue-950
+                                 text-blue-300
+                                 border
+                                 border-blue-800">
+                        {n['tag']}
                     </span>
+
+                    <span class="text-[10px]
+                                 text-slate-400">
+                        {n['press']} · {n['date']}
+                    </span>
+
                 </div>
-                <p class="text-xs text-slate-400 mt-2">
-                    현재 주가: <b class="text-white text-base font-extrabold">{data['latest_price']:,}원</b> ({data['change_pct']:+.2f}%) 
-                    · 현재 배당수익률: <b class="text-blue-400 text-base font-extrabold">{data['current_yield']:.2f}%</b> (연간 실시간 DPS {data['current_dps']:,.0f}원)
+
+                <p class="text-xs
+                          text-slate-200
+                          font-medium
+                          leading-snug">
+                    {n['title']}
                 </p>
-            </div>
-            <div>
-                <a href="https://finance.naver.com/item/main.naver?code={code}" target="_blank" 
-                   class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3.5 py-2 rounded-xl border border-slate-700 transition inline-block">
-                    네이버 증권 열기 ↗
-                </a>
-            </div>
+
+            </a>
+            """
+
+    else:
+
+        news_html = """
+        <p class="text-xs
+                  text-slate-400
+                  text-center
+                  py-16">
+            뉴스가 없습니다.
+        </p>
+        """
+
+    # --------------------------------------------------------
+    # 공시 HTML
+    # --------------------------------------------------------
+
+    notice_html = ""
+
+    if notice_items:
+
+        for n in notice_items:
+
+            notice_html += f"""
+            <a href="{n['link']}"
+               target="_blank"
+               class="block p-3
+                      bg-slate-950/60
+                      hover:bg-slate-950
+                      rounded-xl
+                      border border-slate-800/80
+                      transition">
+
+                <div class="flex
+                            items-center
+                            justify-between
+                            gap-1
+                            mb-1.5">
+
+                    <span class="px-2 py-0.5
+                                 text-[9px]
+                                 font-bold
+                                 rounded
+                                 bg-amber-950
+                                 text-amber-300
+                                 border
+                                 border-amber-800">
+                        {n['tag']}
+                    </span>
+
+                    <span class="text-[10px]
+                                 text-slate-400">
+                        {n['press']} · {n['date']}
+                    </span>
+
+                </div>
+
+                <p class="text-xs
+                          text-slate-200
+                          font-medium
+                          leading-snug">
+                    {n['title']}
+                </p>
+
+            </a>
+            """
+
+    else:
+
+        notice_html = """
+        <p class="text-xs
+                  text-slate-400
+                  text-center
+                  py-16">
+            공시가 없습니다.
+        </p>
+        """
+
+    # --------------------------------------------------------
+    # HTML
+    # --------------------------------------------------------
+
+    html_content = f"""
+<!DOCTYPE html>
+
+<html lang="ko">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+      content="width=device-width,
+               initial-scale=1.0">
+
+<title>
+[{code}] {data['name']}
+종목 맞춤형 동적 가중치 대시보드
+</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+@import url(
+    'https://fonts.googleapis.com/css2?family=Pretendard:wght@400;500;600;700;800&display=swap'
+);
+
+body {{
+    font-family:
+        'Pretendard',
+        sans-serif;
+
+    background-color:
+        #0b0f19;
+
+    color:
+        #f1f5f9;
+}}
+
+.custom-scroll::-webkit-scrollbar {{
+    width: 5px;
+}}
+
+.custom-scroll::-webkit-scrollbar-track {{
+    background:
+        #111827;
+}}
+
+.custom-scroll::-webkit-scrollbar-thumb {{
+    background:
+        #374151;
+
+    border-radius:
+        3px;
+}}
+
+</style>
+
+</head>
+
+<body class="p-3 md:p-6 custom-scroll">
+
+<div class="max-w-7xl mx-auto space-y-4">
+
+
+<!-- ====================================================== -->
+<!-- 헤더 -->
+<!-- ====================================================== -->
+
+<div class="bg-slate-900/90
+            p-5
+            rounded-2xl
+            border border-slate-800
+            shadow-2xl
+            backdrop-blur-md
+            flex
+            flex-col
+            md:flex-row
+            md:items-center
+            justify-between
+            gap-4">
+
+    <div>
+
+        <div class="flex
+                    items-center
+                    gap-3
+                    flex-wrap">
+
+            <h1 class="text-2xl
+                       font-extrabold
+                       text-white
+                       tracking-tight">
+
+                {data['name']}
+
+            </h1>
+
+            <span class="text-xs
+                         px-2.5
+                         py-1
+                         bg-slate-800
+                         text-blue-400
+                         font-mono
+                         rounded-lg
+                         border
+                         border-slate-700">
+
+                {code}
+
+            </span>
+
+            <span class="text-xs
+                         px-3
+                         py-1
+                         bg-indigo-950
+                         text-indigo-300
+                         font-bold
+                         rounded-lg
+                         border
+                         border-indigo-800">
+
+                {profile_desc}
+
+                (배당 {w_div}%
+                :
+                성장 {w_growth}%)
+
+            </span>
+
         </div>
 
-        <!-- [최상단 배치] 종목 맞춤형 동적 가중치 3단계 매수 전략 마스터 결론 카드 -->
-        <div class="p-5 rounded-2xl border shadow-2xl bg-gradient-to-r from-slate-900 via-indigo-950/80 to-slate-900 border-indigo-500/50 space-y-3">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-2">
-                <div class="flex items-center gap-2">
-                    <span class="px-2.5 py-0.5 text-xs font-black rounded-lg bg-indigo-600 text-white">마스터 매매 결론</span>
-                    <h2 class="text-base md:text-lg font-black text-indigo-200 tracking-tight">종목 맞춤형 동적 가중치 3단계 매수가이드</h2>
-                </div>
-                <span class="text-xs text-slate-400">실데이터 기반 · 배당 {w_div}% + 실적 PEG {w_growth}% 최적 조합</span>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <p class="text-xs text-blue-400 font-bold">1차 매수 (30% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b1:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 1년 바닥 + PEG 적정가 ({w_div}:{w_growth})</p>
-                </div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <p class="text-xs text-emerald-400 font-bold">2차 매수 (30% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b2:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 3년 바닥 + PEG 중간 ({w_div}:{w_growth})</p>
-                </div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
-                    <p class="text-xs text-red-400 font-bold">3차 매수 (40% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b3:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 대바닥 + PEG 바닥가 ({w_div}:{w_growth})</p>
-                </div>
-            </div>
+        <p class="text-xs
+                  text-slate-400
+                  mt-2">
+
+            현재 주가:
+
+            <b class="text-white
+                      text-base
+                      font-extrabold">
+
+                {data['latest_price']:,}원
+
+            </b>
+
+            ({data['change_pct']:+.2f}%)
+
+            ·
+
+            현재 배당수익률:
+
+            <b class="text-blue-400
+                      text-base
+                      font-extrabold">
+
+                {data['current_yield']:.2f}%
+
+            </b>
+
+            ·
+
+            연간 DPS:
+
+            <b class="text-emerald-400
+                      text-base
+                      font-extrabold">
+
+                {data['current_dps']:,.0f}원
+
+            </b>
+
+        </p>
+
+    </div>
+
+
+    <div>
+
+        <a href="https://finance.naver.com/item/main.naver?code={code}"
+           target="_blank"
+           class="text-xs
+                  bg-slate-800
+                  hover:bg-slate-700
+                  text-slate-200
+                  px-3.5
+                  py-2
+                  rounded-xl
+                  border
+                  border-slate-700
+                  transition
+                  inline-block">
+
+            네이버 증권 열기 ↗
+
+        </a>
+
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- 마스터 매매 결론 -->
+<!-- ====================================================== -->
+
+<div class="p-5
+            rounded-2xl
+            border
+            shadow-2xl
+            bg-gradient-to-r
+            from-slate-900
+            via-indigo-950/80
+            to-slate-900
+            border-indigo-500/50
+            space-y-3">
+
+    <div class="flex
+                items-center
+                justify-between
+                border-b
+                border-slate-800
+                pb-2
+                gap-2
+                flex-wrap">
+
+        <div class="flex
+                    items-center
+                    gap-2">
+
+            <span class="px-2.5
+                         py-0.5
+                         text-xs
+                         font-black
+                         rounded-lg
+                         bg-indigo-600
+                         text-white">
+
+                마스터 매매 결론
+
+            </span>
+
+            <h2 class="text-base
+                       md:text-lg
+                       font-black
+                       text-indigo-200
+                       tracking-tight">
+
+                종목 맞춤형 동적 가중치
+                3단계 매수가이드
+
+            </h2>
+
         </div>
 
-        <!-- 대형 뷰 전환 스위처 -->
-        <div class="flex items-center gap-2 bg-slate-900/90 p-1.5 rounded-2xl border border-slate-800">
-            <button id="viewDivBtn" onclick="switchMainView('div')" class="flex-1 py-2.5 rounded-xl text-xs font-black bg-blue-600 text-white shadow-lg transition flex items-center justify-center gap-2">
-                <span>💰</span> 배당 가치 분석 뷰 (주가 · 역축 배당률 · 바닥선)
-            </button>
-            <button id="viewGrowthBtn" onclick="switchMainView('growth')" class="flex-1 py-2.5 rounded-xl text-xs font-black bg-slate-800 text-slate-400 hover:text-white transition flex items-center justify-center gap-2">
-                <span>🚀</span> 실적 성장 분석 뷰 (PEG · 실적동행 차트)
-            </button>
+        <span class="text-xs
+                     text-slate-400">
+
+            실데이터 기반
+            ·
+            배당 {w_div}%
+            +
+            실적 성장 {w_growth}%
+
+        </span>
+
+    </div>
+
+
+    <div class="grid
+                grid-cols-1
+                md:grid-cols-3
+                gap-3
+                pt-1">
+
+
+        <div class="bg-slate-950/70
+                    p-3
+                    rounded-xl
+                    border
+                    border-slate-800">
+
+            <p class="text-xs
+                      text-blue-400
+                      font-bold">
+
+                1차 매수
+                (30% 비중)
+
+            </p>
+
+            <h3 class="text-lg
+                       font-black
+                       text-white
+                       mt-0.5">
+
+                {b1:,}원
+
+            </h3>
+
+            <p class="text-[10px]
+                      text-slate-400
+                      mt-0.5">
+
+                배당 1년 바닥
+                +
+                성장 적정가
+
+            </p>
+
         </div>
 
-        <!-- 메인 레이아웃 -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            
-            <div class="lg:col-span-2 space-y-4">
-                
-                <!-- [VIEW 1] 배당 가치 분석 뷰 -->
-                <div id="sectionDividendView" class="space-y-4">
-                    <div class="bg-slate-900/90 p-4 rounded-xl border border-blue-500/40 space-y-1">
-                        <p class="text-xs text-blue-400 font-bold">💰 배당 성장 기반 단독 매수 전략 (실시간 자동 DPS 반영)</p>
-                        <h3 class="text-xl font-black text-white">{div_1y:,}원 <span class="text-xs font-normal text-slate-400">/ 5년 대바닥 {div_5y:,}원</span></h3>
-                        <p class="text-[11px] text-slate-300 pt-1">실시간 크롤링된 DPS 기준 1년 바닥 <b>30% 매수</b>, 5년 대바닥 <b>40% 적극 매수</b></p>
-                    </div>
 
-                    <div class="bg-slate-900/80 p-4 rounded-2xl border border-slate-800 space-y-2.5">
-                        <div class="flex items-center justify-between pb-1.5 border-b border-slate-800">
-                            <h3 class="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                                <span>📊</span> 기간별 배당 바닥선 (최고 배당률 도달 주가)
-                            </h3>
-                            <span class="text-[11px] text-slate-400">행 클릭 시 차트 기간 연동</span>
-                        </div>
-                        <div class="overflow-x-auto">
-                            <table class="w-full text-xs text-left">
-                                <thead class="text-slate-400 bg-slate-950/60 uppercase border-b border-slate-800">
-                                    <tr>
-                                        <th class="py-2 px-2.5">기간</th>
-                                        <th class="py-2 px-2.5">비중</th>
-                                        <th class="py-2 px-2.5 text-blue-400 font-bold">역대 최고 배당률</th>
-                                        <th class="py-2 px-2.5 text-red-400 font-bold">도달 시 바닥 주가</th>
-                                        <th class="py-2 px-2.5">현재가와 괴리율</th>
-                                        <th class="py-2 px-2.5 text-center">매수 판정</th>
-                                    </tr>
-                                </thead>
-                                <tbody class="divide-y divide-slate-800/60 font-medium cursor-pointer">
-                                    {"".join([f'''
-                                    <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
-                                        <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
-                                        <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
-                                        <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
-                                        <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
-                                        <td class="py-2.5 px-2.5 {'text-red-400 font-bold' if m['gap']<=0 else ('text-amber-400' if m['gap']<=3 else 'text-slate-300')}">
-                                            {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
-                                        </td>
-                                        <td class="py-2.5 px-2.5 text-center">
-                                            <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
-                                        </td>
-                                    </tr>
-                                    ''' for m in data['matrix']])}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
+        <div class="bg-slate-950/70
+                    p-3
+                    rounded-xl
+                    border
+                    border-slate-800">
 
-                    <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 space-y-3">
-                        <div class="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800 text-xs">
-                            <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                <button id="btn1Y" onclick="changePeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년</button>
-                                <button id="btn3Y" onclick="changePeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">3년</button>
-                                <button id="btn5Y" onclick="changePeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition">5년</button>
-                                <button id="btn10Y" onclick="changePeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">10년</button>
-                            </div>
-                            <div class="flex flex-wrap items-center gap-3">
-                                <label class="flex items-center gap-1 cursor-pointer text-white font-bold"><input type="checkbox" id="chkPrice" checked onchange="toggleLayers()"> 주가</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-blue-400 font-bold"><input type="checkbox" id="chkYield" checked onchange="toggleLayers()"> 배당수익률(역축)</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-red-400 font-bold"><input type="checkbox" id="chkFloor" checked onchange="toggleLayers()"> 바닥선</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-emerald-400 font-bold"><input type="checkbox" id="chkSniper" checked onchange="toggleLayers()"> 🟢저점신호</label>
-                            </div>
-                        </div>
-                        <div id="chartHud" class="bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                            <div class="flex items-center gap-1.5 font-mono text-slate-400 font-bold"><span>📅</span> <span id="hudDate">-</span></div>
-                            <div class="flex flex-wrap items-center gap-3 font-semibold text-[11px]">
-                                <span class="text-white">주가: <b id="hudPrice" class="font-bold text-white text-xs">-</b></span>
-                                <span class="text-blue-400">배당률: <b id="hudYield">-</b></span>
-                                <span class="text-red-400"><span id="hudFloorLabel">5년</span>바닥가: <b id="hudFloor">-</b></span>
-                            </div>
-                        </div>
-                        <div class="relative h-[290px] w-full"><canvas id="mainChart"></canvas></div>
-                    </div>
+            <p class="text-xs
+                      text-emerald-400
+                      font-bold">
 
-                    <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
-                        <div class="flex items-center justify-between pb-1 border-b border-slate-800 text-xs">
-                            <span class="font-semibold text-slate-300">RSI 과매도 지표 (14)</span>
-                            <span id="rsiHud" class="text-[11px] text-cyan-400 font-bold">RSI: -</span>
-                        </div>
-                        <div class="relative h-[80px] w-full mt-1"><canvas id="rsiChart"></canvas></div>
-                    </div>
-                </div>
+                2차 매수
+                (30% 비중)
 
-                <!-- [VIEW 2] 실적 성장 분석 뷰 -->
-                <div id="sectionGrowthView" class="space-y-4 hidden">
-                    <div class="bg-slate-900/90 p-4 rounded-xl border border-emerald-500/40 space-y-1">
-                        <p class="text-xs text-emerald-400 font-bold">🚀 실적 성장(PEG) 기반 단독 매수 전략 (실데이터 연동)</p>
-                        <h3 class="text-xl font-black text-white">{peg_fair:,}원 <span class="text-xs font-normal text-slate-400">/ 바닥 {peg_bottom:,}원</span></h3>
-                        <p class="text-[11px] text-slate-300 pt-1">PEG 1.0배 적정가에서 <b>50% 분할 매수</b>, PEG 0.5배 바닥가에서 <b>50% 적극 매수</b></p>
-                    </div>
+            </p>
 
-                    <div class="bg-slate-900/90 p-4 rounded-2xl border border-slate-800 space-y-3">
-                        <div class="flex flex-wrap items-center justify-between gap-3 text-xs">
-                            <div class="flex items-center gap-1.5">
-                                <span class="text-[11px] font-bold text-slate-400">집계 단위:</span>
-                                <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                    <button id="btnFreqQ" onclick="changeFinFreq('quarterly')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white transition">분기</button>
-                                    <button id="btnFreqS" onclick="changeFinFreq('semiannual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">반기</button>
-                                    <button id="btnFreqA" onclick="changeFinFreq('annual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년 (연간)</button>
-                                </div>
-                            </div>
-                            <div class="flex items-center gap-1.5">
-                                <span class="text-[11px] font-bold text-slate-400">조회 기간:</span>
-                                <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                    <button id="btnFin1Y" onclick="changeFinPeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년</button>
-                                    <button id="btnFin3Y" onclick="changeFinPeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">3년</button>
-                                    <button id="btnFin5Y" onclick="changeFinPeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition">5년</button>
-                                    <button id="btnFin10Y" onclick="changeFinPeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">10년(전체)</button>
-                                </div>
-                            </div>
-                            <div class="flex flex-wrap items-center gap-2 text-[11px]">
-                                <label class="flex items-center gap-1 cursor-pointer text-white font-bold"><input type="checkbox" id="chkGrowthPrice" checked onchange="toggleGrowthLayers()"> 주가</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-emerald-400 font-bold"><input type="checkbox" id="chkGrowthProf" checked onchange="toggleGrowthLayers()"> 영업익</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-cyan-400 font-bold"><input type="checkbox" id="chkGrowthYoY" checked onchange="toggleGrowthLayers()"> 성장률(YoY)</label>
-                                <label class="flex items-center gap-1 cursor-pointer text-amber-400 font-bold"><input type="checkbox" id="chkGrowthOpm" checked onchange="toggleGrowthLayers()"> OPM</label>
-                            </div>
-                        </div>
-                    </div>
+            <h3 class="text-lg
+                       font-black
+                       text-white
+                       mt-0.5">
 
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-2.5">
-                        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-slate-800">
-                            <p class="text-[11px] text-slate-400">🚀 영업이익 기간 증감</p>
-                            <h4 id="cardProfGrowth" class="text-lg font-bold text-emerald-400 mt-0.5">-</h4>
-                            <span id="cardProfSub" class="text-[10px] text-slate-400">선택 기간 시작 대비</span>
-                        </div>
-                        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-slate-800">
-                            <p class="text-[11px] text-slate-400">📈 OPM 마진 변동폭</p>
-                            <h4 id="cardOpm" class="text-lg font-bold text-amber-400 mt-0.5">-</h4>
-                            <span id="cardOpmSub" class="text-[10px] text-slate-400">시작 ➔ 최근 (평균 OPM)</span>
-                        </div>
-                        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-slate-800">
-                            <p class="text-[11px] text-slate-400">🏢 매출액 기간 증감</p>
-                            <h4 id="cardRevGrowth" class="text-lg font-bold text-slate-200 mt-0.5">-</h4>
-                            <span id="cardRevSub" class="text-[10px] text-slate-400">외형 확장성</span>
-                        </div>
-                        <div class="bg-slate-900/90 p-3.5 rounded-xl border border-slate-800">
-                            <p class="text-[11px] text-slate-400">🛡️ 기간 누적 당기순익</p>
-                            <h4 id="cardNet" class="text-lg font-bold text-white mt-0.5">-</h4>
-                            <span id="cardNetSub" class="text-[10px] text-emerald-400">배당 안전성</span>
-                        </div>
-                    </div>
+                {b2:,}원
 
-                    <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 space-y-3">
-                        <div id="growthChartHud" class="bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                            <div class="flex items-center gap-1.5 font-mono text-slate-300 font-bold"><span>📅</span> <span id="gHudDate">-</span></div>
-                            <div class="flex flex-wrap items-center gap-3 font-semibold text-[11px]">
-                                <span class="text-white">주가: <b id="gHudPrice" class="font-bold text-white text-xs">-</b></span>
-                                <span class="text-emerald-400">영업익: <b id="gHudProf">-</b></span>
-                                <span class="text-cyan-400">YoY성장률: <b id="gHudYoY">-</b></span>
-                                <span class="text-amber-400">OPM: <b id="gHudOpm">-</b></span>
-                            </div>
-                        </div>
-                        <div class="flex items-center justify-between text-xs text-slate-300 pt-1">
-                            <span id="growthChartTitle" class="font-bold text-slate-200">실적 & 주가 동행 차트</span>
-                            <span class="text-[11px] text-slate-400">막대: 영업익 · 흰색선: 주가 · 하늘선: YoY · 노란선: OPM</span>
-                        </div>
-                        <div class="relative h-[360px] w-full"><canvas id="growthChart"></canvas></div>
-                    </div>
-                </div>
+            </h3>
 
-            </div>
+            <p class="text-[10px]
+                      text-slate-400
+                      mt-0.5">
 
-            <!-- 우측 뉴스/공시 -->
-            <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 flex flex-col h-[540px]">
-                <div class="flex items-center gap-2 border-b border-slate-800 pb-2.5">
-                    <button id="tabNewsBtn" onclick="switchTab('news')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-blue-600 text-white transition">📰 뉴스</button>
-                    <button id="tabNoticeBtn" onclick="switchTab('notice')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition">📑 공시</button>
-                </div>
-                <div id="feedNews" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
-                </div>
-                <div id="feedNotice" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll hidden">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
-                </div>
-            </div>
+                배당 3년 바닥
+                +
+                성장 적정가
+
+            </p>
+
+        </div>
+
+
+        <div class="bg-slate-950/70
+                    p-3
+                    rounded-xl
+                    border
+                    border-slate-800">
+
+            <p class="text-xs
+                      text-amber-400
+                      font-bold">
+
+                3차 매수
+                (40% 비중)
+
+            </p>
+
+            <h3 class="text-lg
+                       font-black
+                       text-white
+                       mt-0.5">
+
+                {b3:,}원
+
+            </h3>
+
+            <p class="text-[10px]
+                      text-slate-400
+                      mt-0.5">
+
+                배당 5년 바닥
+                +
+                성장 하단가
+
+            </p>
 
         </div>
 
     </div>
 
-    <script>
-        function switchMainView(mode) {{
-            const btnDiv = document.getElementById('viewDivBtn');
-            const btnGrowth = document.getElementById('viewGrowthBtn');
-            const secDiv = document.getElementById('sectionDividendView');
-            const secGrowth = document.getElementById('sectionGrowthView');
+</div>
 
-            if (mode === 'div') {{
-                btnDiv.className = "flex-1 py-2.5 rounded-xl text-xs font-black bg-blue-600 text-white shadow-lg transition flex items-center justify-center gap-2";
-                btnGrowth.className = "flex-1 py-2.5 rounded-xl text-xs font-black bg-slate-800 text-slate-400 hover:text-white transition flex items-center justify-center gap-2";
-                secDiv.classList.remove('hidden');
-                secGrowth.classList.add('hidden');
-            }} else {{
-                btnGrowth.className = "flex-1 py-2.5 rounded-xl text-xs font-black bg-blue-600 text-white shadow-lg transition flex items-center justify-center gap-2";
-                btnDiv.className = "flex-1 py-2.5 rounded-xl text-xs font-black bg-slate-800 text-slate-400 hover:text-white transition flex items-center justify-center gap-2";
-                secGrowth.classList.remove('hidden');
-                secDiv.classList.add('hidden');
-                updateGrowthChart();
-            }}
-        }}
 
-        function switchTab(type) {{
-            const tabNewsBtn = document.getElementById('tabNewsBtn');
-            const tabNoticeBtn = document.getElementById('tabNoticeBtn');
-            const feedNews = document.getElementById('feedNews');
-            const feedNotice = document.getElementById('feedNotice');
-            if (type === 'news') {{
-                tabNewsBtn.className = "flex-1 py-1.5 text-xs font-bold rounded-lg bg-blue-600 text-white transition";
-                tabNoticeBtn.className = "flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition";
-                feedNews.classList.remove('hidden'); feedNotice.classList.add('hidden');
-            }} else {{
-                tabNoticeBtn.className = "flex-1 py-1.5 text-xs font-bold rounded-lg bg-blue-600 text-white transition";
-                tabNewsBtn.className = "flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition";
-                feedNotice.classList.remove('hidden'); feedNews.classList.add('hidden');
-            }}
-        }}
+<!-- ====================================================== -->
+<!-- 배당 역사 -->
+<!-- ====================================================== -->
 
-        // 배당 차트 엔진
-        const rawData = {json.dumps(data['chart_payload'])};
-        let currentPeriod = '5Y';
-        const periodPoints = {{ '1Y': 26, '3Y': 78, '5Y': 130, '10Y': rawData.dates.length }};
-        let activeDates = [], activePrices = [], activeYields = [], activeFloors = [], activeSnipers = [], activeRsis = [];
+<div class="bg-slate-900/80
+            p-5
+            rounded-2xl
+            border border-slate-800">
 
-        function sliceDataForPeriod(periodKey) {{
-            let pts = periodPoints[periodKey];
-            if (!pts || pts > rawData.dates.length) pts = rawData.dates.length;
-            const startIdx = Math.max(0, rawData.dates.length - pts);
-            activeDates = rawData.dates.slice(startIdx);
-            activePrices = rawData.prices.slice(startIdx);
-            activeYields = rawData.yields.slice(startIdx);
-            activeRsis = rawData.rsis.slice(startIdx);
-            const maxYield = rawData.stats[periodKey].max_yield;
-            activeFloors = rawData.dps.slice(startIdx).map(d => maxYield > 0 ? Math.round(d / (maxYield / 100)) : 0);
-            activeSnipers = activePrices.map((p, i) => (p <= activeFloors[i] * 1.03 && activeRsis[i] <= 45) ? p : null);
-        }}
-        sliceDataForPeriod('5Y');
+    <div class="flex
+                items-center
+                justify-between
+                mb-4
+                flex-wrap
+                gap-2">
 
-        const ctxMain = document.getElementById('mainChart').getContext('2d');
-        const mainChart = new Chart(ctxMain, {{
-            type: 'line',
-            data: {{
-                labels: activeDates,
-                datasets: [
-                    {{ label: '🟢 저점신호', data: activeSnipers, borderColor: '#10b981', backgroundColor: '#10b981', pointRadius: 6, showLine: false, yAxisID: 'y_price', order: 1 }},
-                    {{ label: '주가 (원)', data: activePrices, borderColor: '#ffffff', borderWidth: 2, tension: 0.1, pointRadius: 0, yAxisID: 'y_price', order: 2 }},
-                    {{ label: '배당수익률 (%)', data: activeYields, borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.08)', borderWidth: 2, fill: true, tension: 0.2, pointRadius: 0, yAxisID: 'y_yield', order: 3 }},
-                    {{ label: '바닥선', data: activeFloors, borderColor: '#ef4444', borderWidth: 1.8, borderDash: [4, 4], pointRadius: 0, yAxisID: 'y_price', order: 4 }}
-                ]
-            }},
-            options: {{
-                responsive: true, maintainAspectRatio: false, interaction: {{ mode: 'index', intersect: false }},
-                plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: false, external: function(context) {{ if (context.tooltip && context.tooltip.dataPoints && context.tooltip.dataPoints.length > 0) updateHud(context.tooltip.dataPoints[0].dataIndex); }} }} }},
-                scales: {{
-                    x: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#94a3b8', maxTicksLimit: 8, font: {{size: 10}} }} }},
-                    y_price: {{ type: 'linear', position: 'left', grid: {{ color: '#334155' }}, ticks: {{ color: '#ffffff', font: {{size: 10}}, callback: v => v.toLocaleString() + '원' }} }},
-                    y_yield: {{ type: 'linear', position: 'right', reverse: true, grid: {{ drawOnChartArea: false }}, ticks: {{ color: '#3b82f6', font: {{size: 10}}, callback: v => v.toFixed(1) + '%' }} }}
+        <div>
+
+            <h2 class="text-lg
+                       font-black
+                       text-white">
+
+                📊 배당수익률 역사
+
+            </h2>
+
+            <p class="text-xs
+                      text-slate-500
+                      mt-1">
+
+                과거 주가와 현재 DPS를 기준으로
+                계산한 역사적 배당수익률
+
+            </p>
+
+        </div>
+
+        <div class="flex
+                    gap-2
+                    flex-wrap">
+
+            <button
+                onclick="changeDividendPeriod('1Y')"
+                id="btnDiv1Y"
+                class="px-3
+                       py-1.5
+                       rounded-lg
+                       text-xs
+                       font-bold
+                       bg-blue-600
+                       text-white">
+
+                1Y
+
+            </button>
+
+            <button
+                onclick="changeDividendPeriod('3Y')"
+                id="btnDiv3Y"
+                class="px-3
+                       py-1.5
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                3Y
+
+            </button>
+
+            <button
+                onclick="changeDividendPeriod('5Y')"
+                id="btnDiv5Y"
+                class="px-3
+                       py-1.5
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                5Y
+
+            </button>
+
+            <button
+                onclick="changeDividendPeriod('10Y')"
+                id="btnDiv10Y"
+                class="px-3
+                       py-1.5
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                10Y
+
+            </button>
+
+        </div>
+
+    </div>
+
+    <div class="h-[360px]">
+
+        <canvas id="dividendChart"></canvas>
+
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- 기간별 배당 바닥 가격 -->
+<!-- ====================================================== -->
+
+<div class="bg-slate-900/80
+            p-5
+            rounded-2xl
+            border border-slate-800">
+
+    <div class="mb-4">
+
+        <h2 class="text-lg
+                   font-black
+                   text-white">
+
+            🎯 기간별 배당 안전마진
+
+        </h2>
+
+        <p class="text-xs
+                  text-slate-500
+                  mt-1">
+
+            역사적 최대 배당수익률을 기준으로 계산한
+            기간별 바닥 가격
+
+        </p>
+
+    </div>
+
+    <div class="grid
+                grid-cols-1
+                md:grid-cols-2
+                xl:grid-cols-4
+                gap-3">
+
+        {matrix_cards}
+
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- 성장 차트 -->
+<!-- ====================================================== -->
+
+<div class="bg-slate-900/80
+            p-5
+            rounded-2xl
+            border border-slate-800">
+
+    <div class="flex
+                items-center
+                justify-between
+                flex-wrap
+                gap-3
+                mb-4">
+
+        <div>
+
+            <h2 class="text-lg
+                       font-black
+                       text-white">
+
+                📈 가격 / 성장률 분석
+
+            </h2>
+
+            <p class="text-xs
+                      text-slate-500
+                      mt-1">
+
+                가격과 성장 관련 지표를 함께 확인합니다.
+
+            </p>
+
+        </div>
+
+        <div class="flex
+                    items-center
+                    gap-2
+                    flex-wrap">
+
+            <button
+                onclick="changeFinPeriod('1Y')"
+                id="btnFin1Y"
+                class="px-2.5
+                       py-1
+                       rounded-lg
+                       text-xs
+                       font-bold
+                       bg-blue-600
+                       text-white">
+
+                1Y
+
+            </button>
+
+            <button
+                onclick="changeFinPeriod('3Y')"
+                id="btnFin3Y"
+                class="px-2.5
+                       py-1
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                3Y
+
+            </button>
+
+            <button
+                onclick="changeFinPeriod('5Y')"
+                id="btnFin5Y"
+                class="px-2.5
+                       py-1
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                5Y
+
+            </button>
+
+            <button
+                onclick="changeFinPeriod('10Y')"
+                id="btnFin10Y"
+                class="px-2.5
+                       py-1
+                       rounded-lg
+                       text-xs
+                       font-semibold
+                       bg-slate-800
+                       text-slate-400">
+
+                10Y
+
+            </button>
+
+        </div>
+
+    </div>
+
+    <div class="flex
+                flex-wrap
+                gap-3
+                mb-3">
+
+        <label class="text-xs
+                      text-slate-300">
+
+            <input
+                type="checkbox"
+                id="chkGrowthPrice"
+                checked
+                onchange="toggleGrowthLayers()">
+
+            가격
+
+        </label>
+
+        <label class="text-xs
+                      text-slate-300">
+
+            <input
+                type="checkbox"
+                id="chkGrowthYoY"
+                checked
+                onchange="toggleGrowthLayers()">
+
+            배당률
+
+        </label>
+
+        <label class="text-xs
+                      text-slate-300">
+
+            <input
+                type="checkbox"
+                id="chkGrowthOpm"
+                checked
+                onchange="toggleGrowthLayers()">
+
+            RSI
+
+        </label>
+
+    </div>
+
+    <div class="h-[360px]">
+
+        <canvas id="growthChart"></canvas>
+
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- 뉴스 / 공시 -->
+<!-- ====================================================== -->
+
+<div class="grid
+            grid-cols-1
+            lg:grid-cols-2
+            gap-4">
+
+
+    <div class="bg-slate-900/80
+                p-5
+                rounded-2xl
+                border
+                border-slate-800">
+
+        <div class="flex
+                    items-center
+                    justify-between
+                    mb-3">
+
+            <h2 class="text-lg
+                       font-black
+                       text-white">
+
+                📰 최근 뉴스
+
+            </h2>
+
+        </div>
+
+        <div class="flex-1
+                    overflow-y-auto
+                    space-y-2
+                    pt-2.5
+                    pr-1
+                    custom-scroll
+                    max-h-[500px]">
+
+            {news_html}
+
+        </div>
+
+    </div>
+
+
+    <div class="bg-slate-900/80
+                p-5
+                rounded-2xl
+                border
+                border-slate-800">
+
+        <div class="flex
+                    items-center
+                    justify-between
+                    mb-3">
+
+            <h2 class="text-lg
+                       font-black
+                       text-white">
+
+                📢 최근 공시
+
+            </h2>
+
+        </div>
+
+        <div class="flex-1
+                    overflow-y-auto
+                    space-y-2
+                    pt-2.5
+                    pr-1
+                    custom-scroll
+                    max-h-[500px]">
+
+            {notice_html}
+
+        </div>
+
+    </div>
+
+</div>
+
+
+<!-- ====================================================== -->
+<!-- 하단 정보 -->
+<!-- ====================================================== -->
+
+<div class="bg-slate-900/60
+            p-4
+            rounded-xl
+            border
+            border-slate-800">
+
+    <div class="grid
+                grid-cols-1
+                md:grid-cols-4
+                gap-3">
+
+        <div>
+
+            <p class="text-[10px]
+                      text-slate-500">
+
+                현재 DPS
+
+            </p>
+
+            <p class="text-sm
+                      font-black
+                      text-white">
+
+                {data['current_dps']:,.0f}원
+
+            </p>
+
+        </div>
+
+        <div>
+
+            <p class="text-[10px]
+                      text-slate-500">
+
+                성장률
+
+            </p>
+
+            <p class="text-sm
+                      font-black
+                      text-white">
+
+                {gm.get('growth_rate', 0):.2f}%
+
+            </p>
+
+        </div>
+
+        <div>
+
+            <p class="text-[10px]
+                      text-slate-500">
+
+                성장 적정가
+
+            </p>
+
+            <p class="text-sm
+                      font-black
+                      text-white">
+
+                {peg_fair:,.0f}원
+
+            </p>
+
+        </div>
+
+        <div>
+
+            <p class="text-[10px]
+                      text-slate-500">
+
+                성장 하단가
+
+            </p>
+
+            <p class="text-sm
+                      font-black
+                      text-white">
+
+                {peg_bottom:,.0f}원
+
+            </p>
+
+        </div>
+
+    </div>
+
+</div>
+
+
+</div>
+
+
+<script>
+
+/* ========================================================
+   Python 데이터
+   ======================================================== */
+
+const chartPayload =
+    {chart_payload_json};
+
+let dividendChart = null;
+let growthChart = null;
+
+let currentDividendPeriod = "1Y";
+let curFinPeriod = "1Y";
+
+
+/* ========================================================
+   기간 필터
+   ======================================================== */
+
+function getFilteredData(period) {{
+
+    const years =
+        period === "1Y" ? 1 :
+        period === "3Y" ? 3 :
+        period === "5Y" ? 5 :
+        10;
+
+    const total =
+        chartPayload.dates.length;
+
+    const count = Math.min(
+        total,
+        Math.ceil(
+            years * 26
+        )
+    );
+
+    const start =
+        Math.max(
+            0,
+            total - count
+        );
+
+    return {{
+        dates:
+            chartPayload.dates.slice(
+                start
+            ),
+
+        prices:
+            chartPayload.prices.slice(
+                start
+            ),
+
+        yields:
+            chartPayload.yields.slice(
+                start
+            ),
+
+        rsis:
+            chartPayload.rsis.slice(
+                start
+            )
+    }};
+}}
+
+
+/* ========================================================
+   배당 차트
+   ======================================================== */
+
+function renderDividendChart() {{
+
+    const d =
+        getFilteredData(
+            currentDividendPeriod
+        );
+
+    const ctx =
+        document
+        .getElementById(
+            "dividendChart"
+        )
+        .getContext("2d");
+
+    if (dividendChart) {{
+        dividendChart.destroy();
+    }}
+
+    dividendChart =
+        new Chart(
+            ctx,
+            {{
+
+                type: "line",
+
+                data: {{
+
+                    labels:
+                        d.dates,
+
+                    datasets: [
+
+                        {{
+                            label:
+                                "배당수익률",
+
+                            data:
+                                d.yields,
+
+                            borderWidth:
+                                2,
+
+                            pointRadius:
+                                0,
+
+                            tension:
+                                0.2,
+
+                            yAxisID:
+                                "y"
+                        }}
+
+                    ]
+
+                }},
+
+                options: {{
+
+                    responsive:
+                        true,
+
+                    maintainAspectRatio:
+                        false,
+
+                    interaction: {{
+                        mode:
+                            "index",
+                        intersect:
+                            false
+                    }},
+
+                    plugins: {{
+
+                        legend: {{
+                            labels: {{
+                                color:
+                                    "#cbd5e1"
+                            }}
+                        }}
+
+                    }},
+
+                    scales: {{
+
+                        x: {{
+                            ticks: {{
+                                color:
+                                    "#64748b",
+                                maxTicksLimit:
+                                    10
+                            }},
+
+                            grid: {{
+                                color:
+                                    "rgba(100,116,139,0.12)"
+                            }}
+                        }},
+
+                        y: {{
+
+                            position:
+                                "left",
+
+                            ticks: {{
+                                color:
+                                    "#60a5fa",
+
+                                callback:
+                                    function(value) {{
+                                        return value
+                                            + "%";
+                                    }}
+                            }},
+
+                            grid: {{
+                                color:
+                                    "rgba(100,116,139,0.12)"
+                            }}
+
+                        }}
+
+                    }}
+
                 }}
+
             }}
-        }});
+        );
+}}
 
-        const ctxRsi = document.getElementById('rsiChart').getContext('2d');
-        const rsiChart = new Chart(ctxRsi, {{
-            type: 'line',
-            data: {{ labels: activeDates, datasets: [{{ data: activeRsis, borderColor: '#22d3ee', borderWidth: 1.5, pointRadius: 0, tension: 0.1 }}] }},
-            options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ display: false }} }}, scales: {{ x: {{ display: false }}, y: {{ min: 0, max: 100, grid: {{ color: '#1e293b' }}, ticks: {{ color: '#64748b', stepSize: 30, font: {{size: 9}} }} }} }} }}
-        }});
 
-        function updateHud(idx) {{
-            if (idx < 0 || idx >= activeDates.length) return;
-            document.getElementById('hudDate').innerText = activeDates[idx];
-            document.getElementById('hudPrice').innerText = activePrices[idx].toLocaleString() + '원';
-            document.getElementById('hudYield').innerText = activeYields[idx].toFixed(2) + '%';
-            document.getElementById('hudFloor').innerText = activeFloors[idx].toLocaleString() + '원';
-            document.getElementById('rsiHud').innerText = 'RSI: ' + activeRsis[idx].toFixed(1);
-        }}
-        updateHud(activeDates.length - 1);
+/* ========================================================
+   배당 기간 변경
+   ======================================================== */
 
-        function changePeriod(key) {{
-            currentPeriod = key;
-            ['1Y', '3Y', '5Y', '10Y'].forEach(k => {{
-                const btn = document.getElementById('btn' + k);
-                if (btn) btn.className = (k === key) ? "px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition" : "px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition";
-            }});
-            document.getElementById('hudFloorLabel').innerText = (key === '1Y' ? '1년' : (key === '3Y' ? '3년' : (key === '5Y' ? '5년' : '10년')));
-            sliceDataForPeriod(key);
-            mainChart.data.labels = activeDates;
-            mainChart.data.datasets[0].data = activeSnipers;
-            mainChart.data.datasets[1].data = activePrices;
-            mainChart.data.datasets[2].data = activeYields;
-            mainChart.data.datasets[3].data = activeFloors;
-            mainChart.update();
-            rsiChart.data.labels = activeDates;
-            rsiChart.data.datasets[0].data = activeRsis;
-            rsiChart.update();
-            updateHud(activeDates.length - 1);
-        }}
+function changeDividendPeriod(period) {{
 
-        function toggleLayers() {{
-            mainChart.data.datasets[0].hidden = !document.getElementById('chkSniper').checked;
-            mainChart.data.datasets[1].hidden = !document.getElementById('chkPrice').checked;
-            mainChart.data.datasets[2].hidden = !document.getElementById('chkYield').checked;
-            mainChart.data.datasets[3].hidden = !document.getElementById('chkFloor').checked;
-            mainChart.options.scales.y_yield.display = document.getElementById('chkYield').checked;
-            mainChart.update();
-        }}
+    currentDividendPeriod =
+        period;
 
-        // 실적 성장 차트 엔진
-        const finRaw = {json.dumps(fin)};
-        let curFinFreq = 'quarterly';
-        let curFinPeriod = '5Y';
-        const finPeriodCount = {{ 'quarterly': {{ '1Y': 4, '3Y': 12, '5Y': 20, '10Y': 40 }}, 'semiannual': {{ '1Y': 2, '3Y': 6, '5Y': 10, '10Y': 20 }}, 'annual': {{ '1Y': 1, '3Y': 3, '5Y': 5, '10Y': 10 }} }};
-        let curGrowthLabels = [], curGrowthPrices = [], curGrowthProfit = [], curGrowthRev = [], curGrowthOpm = [], curGrowthYoY = [];
+    [
+        "1Y",
+        "3Y",
+        "5Y",
+        "10Y"
+    ].forEach(
+        function(p) {{
 
-        function updateGrowthHud(idx) {{
-            if (idx < 0 || idx >= curGrowthLabels.length) return;
-            document.getElementById('gHudDate').innerText = curGrowthLabels[idx];
-            document.getElementById('gHudPrice').innerText = (curGrowthPrices[idx] || 0).toLocaleString() + '원';
-            document.getElementById('gHudProf').innerText = (curGrowthProfit[idx] || 0).toLocaleString() + '억원';
-            document.getElementById('gHudYoY').innerText = ((curGrowthYoY[idx] || 0) >= 0 ? '+' : '') + (curGrowthYoY[idx] || 0).toFixed(1) + '%';
-            document.getElementById('gHudOpm').innerText = (curGrowthOpm[idx] || 0).toFixed(1) + '%';
-        }}
+            const btn =
+                document.getElementById(
+                    "btnDiv" + p
+                );
 
-        const ctxGrowth = document.getElementById('growthChart').getContext('2d');
-        const growthChart = new Chart(ctxGrowth, {{
-            type: 'bar',
-            data: {{
-                labels: [],
-                datasets: [
-                    {{ type: 'line', label: '주가 (원)', data: [], borderColor: '#ffffff', borderWidth: 2, pointRadius: 3, yAxisID: 'y_price', order: 1 }},
-                    {{ type: 'line', label: 'YoY 성장률 (%)', data: [], borderColor: '#38bdf8', borderWidth: 2, borderDash: [2, 2], pointRadius: 3, yAxisID: 'y_growth', order: 2 }},
-                    {{ type: 'line', label: '영업이익률 OPM (%)', data: [], borderColor: '#fbbf24', backgroundColor: '#fbbf24', borderWidth: 2, pointRadius: 3, yAxisID: 'y_opm', order: 3 }},
-                    {{ type: 'bar', label: '영업이익 (억원)', data: [], backgroundColor: '#10b981', borderRadius: 4, maxBarThickness: 16, categoryPercentage: 0.7, barPercentage: 0.8, yAxisID: 'y_profit', order: 4 }}
-                ]
-            }},
-            options: {{
-                responsive: true, maintainAspectRatio: false, interaction: {{ mode: 'index', intersect: false }},
-                plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: false, external: function(context) {{ if (context.tooltip && context.tooltip.dataPoints && context.tooltip.dataPoints.length > 0) updateGrowthHud(context.tooltip.dataPoints[0].dataIndex); }} }} }},
-                scales: {{
-                    x: {{ grid: {{ color: '#1e293b' }}, ticks: {{ color: '#cbd5e1', font: {{size: 10}} }} }},
-                    y_profit: {{ type: 'linear', position: 'left', grid: {{ color: '#334155' }}, ticks: {{ color: '#10b981', font: {{size: 10}}, callback: v => v.toLocaleString() + '억' }} }},
-                    y_price: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }}, ticks: {{ color: '#ffffff', font: {{size: 10}}, callback: v => v.toLocaleString() + '원' }} }},
-                    y_growth: {{ type: 'linear', position: 'right', grid: {{ drawOnChartArea: false }}, ticks: {{ color: '#38bdf8', font: {{size: 10}}, callback: v => v + '%' }} }},
-                    y_opm: {{ type: 'linear', position: 'right', display: false }}
+            if (!btn)
+                return;
+
+            if (p === period) {{
+
+                btn.className =
+                    "px-3 py-1.5 rounded-lg "
+                    + "text-xs font-bold "
+                    + "bg-blue-600 "
+                    + "text-white";
+
+            }} else {{
+
+                btn.className =
+                    "px-3 py-1.5 rounded-lg "
+                    + "text-xs font-semibold "
+                    + "bg-slate-800 "
+                    + "text-slate-400";
+
+            }}
+
+        }
+    );
+
+    renderDividendChart();
+}}
+
+
+/* ========================================================
+   성장 차트
+   ======================================================== */
+
+function renderGrowthChart() {{
+
+    const d =
+        getFilteredData(
+            curFinPeriod
+        );
+
+    const ctx =
+        document
+        .getElementById(
+            "growthChart"
+        )
+        .getContext("2d");
+
+    if (growthChart) {{
+        growthChart.destroy();
+    }}
+
+    growthChart =
+        new Chart(
+            ctx,
+            {{
+
+                type:
+                    "line",
+
+                data: {{
+
+                    labels:
+                        d.dates,
+
+                    datasets: [
+
+                        {{
+                            label:
+                                "가격",
+
+                            data:
+                                d.prices,
+
+                            borderWidth:
+                                2,
+
+                            pointRadius:
+                                0,
+
+                            tension:
+                                0.2,
+
+                            yAxisID:
+                                "y_price"
+                        }},
+
+                        {{
+                            label:
+                                "배당수익률",
+
+                            data:
+                                d.yields,
+
+                            borderWidth:
+                                2,
+
+                            pointRadius:
+                                0,
+
+                            tension:
+                                0.2,
+
+                            yAxisID:
+                                "y_growth"
+                        }},
+
+                        {{
+                            label:
+                                "RSI",
+
+                            data:
+                                d.rsis,
+
+                            borderWidth:
+                                2,
+
+                            pointRadius:
+                                0,
+
+                            tension:
+                                0.2,
+
+                            yAxisID:
+                                "y_growth"
+                        }},
+
+                        {{
+                            label:
+                                "성장률 기준선",
+
+                            data:
+                                d.dates.map(
+                                    () => {gm.get('growth_rate', 7.0)}
+                                ),
+
+                            borderWidth:
+                                1,
+
+                            pointRadius:
+                                0,
+
+                            borderDash:
+                                [5,5],
+
+                            yAxisID:
+                                "y_growth"
+                        }}
+
+                    ]
+
+                }},
+
+                options: {{
+
+                    responsive:
+                        true,
+
+                    maintainAspectRatio:
+                        false,
+
+                    interaction: {{
+                        mode:
+                            "index",
+                        intersect:
+                            false
+                    }},
+
+                    plugins: {{
+
+                        legend: {{
+                            labels: {{
+                                color:
+                                    "#cbd5e1"
+                            }}
+                        }}
+
+                    }},
+
+                    scales: {{
+
+                        y_price: {{
+
+                            type:
+                                "linear",
+
+                            position:
+                                "left",
+
+                            display:
+                                true,
+
+                            ticks: {{
+                                color:
+                                    "#f8fafc"
+                            }},
+
+                            grid: {{
+                                color:
+                                    "rgba(100,116,139,0.12)"
+                            }}
+
+                        }},
+
+                        y_growth: {{
+
+                            type:
+                                "linear",
+
+                            position:
+                                "right",
+
+                            display:
+                                true,
+
+                            ticks: {{
+                                color:
+                                    "#60a5fa"
+                            }},
+
+                            grid: {{
+                                drawOnChartArea:
+                                    false
+                            }}
+
+                        }},
+
+                        x: {{
+
+                            ticks: {{
+                                color:
+                                    "#64748b",
+
+                                maxTicksLimit:
+                                    10
+                            }},
+
+                            grid: {{
+                                color:
+                                    "rgba(100,116,139,0.12)"
+                            }}
+
+                        }}
+
+                    }}
+
                 }}
+
             }}
-        }});
+        );
+}}
 
-        function updateGrowthChart() {{
-            const targetData = finRaw[curFinFreq];
-            if (!targetData || !targetData.labels || targetData.labels.length === 0) return;
-            const totalAvail = targetData.labels.length;
-            const targetLimit = finPeriodCount[curFinFreq][curFinPeriod] || totalAvail;
-            const actualCount = Math.min(totalAvail, targetLimit);
-            const startIdx = Math.max(0, totalAvail - actualCount);
 
-            curGrowthLabels = targetData.labels.slice(startIdx);
-            curGrowthProfit = targetData.profit.slice(startIdx);
-            curGrowthRev = targetData.revenue.slice(startIdx);
-            curGrowthOpm = targetData.opm.slice(startIdx);
-            curGrowthPrices = (targetData.prices || []).slice(startIdx);
-            curGrowthYoY = (targetData.growth_yoy || []).slice(startIdx);
-            const curNet = (targetData.net || []).slice(startIdx);
+/* ========================================================
+   재무 기간 변경
+   ======================================================== */
 
-            growthChart.data.labels = curGrowthLabels;
-            growthChart.data.datasets[0].data = curGrowthPrices;
-            growthChart.data.datasets[1].data = curGrowthYoY;
-            growthChart.data.datasets[2].data = curGrowthOpm;
-            growthChart.data.datasets[3].data = curGrowthProfit;
-            growthChart.update();
+function changeFinPeriod(period) {{
 
-            if (curGrowthProfit.length >= 2) {{
-                const firstP = curGrowthProfit[0], lastP = curGrowthProfit[curGrowthProfit.length - 1];
-                const pChange = firstP !== 0 ? (((lastP - firstP) / Math.abs(firstP)) * 100) : 0;
-                document.getElementById('cardProfGrowth').innerText = (pChange >= 0 ? '+' : '') + pChange.toFixed(1) + '%';
-                document.getElementById('cardProfGrowth').className = pChange >= 0 ? 'text-lg font-bold text-red-400 mt-0.5' : 'text-lg font-bold text-blue-400 mt-0.5';
-                document.getElementById('cardProfSub').innerText = curGrowthLabels[0] + ' 대비 ' + curGrowthLabels[curGrowthLabels.length - 1] + ' 변화';
+    curFinPeriod =
+        period;
 
-                const firstOpm = curGrowthOpm[0], lastOpm = curGrowthOpm[curGrowthOpm.length - 1], opmDiff = lastOpm - firstOpm;
-                const avgOpm = curGrowthOpm.reduce((a, b) => a + b, 0) / curGrowthOpm.length;
-                document.getElementById('cardOpm').innerText = (opmDiff >= 0 ? '+' : '') + opmDiff.toFixed(1) + '%p';
-                document.getElementById('cardOpm').className = opmDiff >= 0 ? 'text-lg font-bold text-emerald-400 mt-0.5' : 'text-lg font-bold text-blue-400 mt-0.5';
-                document.getElementById('cardOpmSub').innerText = '시작 ' + firstOpm.toFixed(1) + '% ➔ 최근 ' + lastOpm.toFixed(1) + '% (평균 ' + avgOpm.toFixed(1) + '%)';
+    [
+        "1Y",
+        "3Y",
+        "5Y",
+        "10Y"
+    ].forEach(
+        function(p) {{
 
-                const firstR = curGrowthRev[0], lastR = curGrowthRev[curGrowthRev.length - 1];
-                const rChange = firstR !== 0 ? (((lastR - firstR) / Math.abs(firstR)) * 100) : 0;
-                document.getElementById('cardRevGrowth').innerText = (rChange >= 0 ? '+' : '') + rChange.toFixed(1) + '%';
-                document.getElementById('cardRevGrowth').className = rChange >= 0 ? 'text-lg font-bold text-red-400 mt-0.5' : 'text-lg font-bold text-blue-400 mt-0.5';
-                document.getElementById('cardRevSub').innerText = firstR.toLocaleString() + '억 ➔ ' + lastR.toLocaleString() + '억';
+            const btn =
+                document.getElementById(
+                    "btnFin" + p
+                );
 
-                const totalNet = curNet.reduce((a, b) => a + b, 0);
-                const hasDeficit = curNet.some(v => v < 0);
-                document.getElementById('cardNet').innerText = totalNet.toLocaleString() + '억원';
-                document.getElementById('cardNetSub').innerText = hasDeficit ? '⚠️ 일부 적자 발생' : '🛡️ 전 구간 흑자 지속';
+            if (!btn)
+                return;
+
+            if (p === period) {{
+
+                btn.className =
+                    "px-2.5 py-1 "
+                    + "rounded-lg text-xs "
+                    + "font-bold "
+                    + "bg-blue-600 "
+                    + "text-white";
+
+            }} else {{
+
+                btn.className =
+                    "px-2.5 py-1 "
+                    + "rounded-lg text-xs "
+                    + "font-semibold "
+                    + "bg-slate-800 "
+                    + "text-slate-400";
+
             }}
-            updateGrowthHud(curGrowthLabels.length - 1);
-        }}
 
-        function changeFinFreq(freq) {{
-            curFinFreq = freq;
-            document.getElementById('btnFreqQ').className = (freq === 'quarterly') ? "px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white transition" : "px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition";
-            document.getElementById('btnFreqS').className = (freq === 'semiannual') ? "px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white transition" : "px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition";
-            document.getElementById('btnFreqA').className = (freq === 'annual') ? "px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white transition" : "px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition";
-            updateGrowthChart();
-        }}
+        }
+    );
 
-        function changeFinPeriod(period) {{
-            curFinPeriod = period;
-            ['1Y', '3Y', '5Y', '10Y'].forEach(p => {{
-                const btn = document.getElementById('btnFin' + p);
-                if (btn) btn.className = (p === period) ? "px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition" : "px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition";
-            }});
-            updateGrowthChart();
-        }}
+    renderGrowthChart();
+}}
 
-        function toggleGrowthLayers() {{
-            growthChart.data.datasets[0].hidden = !document.getElementById('chkGrowthPrice').checked;
-            growthChart.data.datasets[1].hidden = !document.getElementById('chkGrowthYoY').checked;
-            growthChart.data.datasets[2].hidden = !document.getElementById('chkGrowthOpm').checked;
-            growthChart.data.datasets[3].hidden = !document.getElementById('chkGrowthProf').checked;
-            growthChart.options.scales.y_price.display = document.getElementById('chkGrowthPrice').checked;
-            growthChart.options.scales.y_growth.display = document.getElementById('chkGrowthYoY').checked;
-            growthChart.update();
-        }}
-        updateGrowthChart();
-    </script>
+
+/* ========================================================
+   성장 레이어 토글
+   ======================================================== */
+
+function toggleGrowthLayers() {{
+
+    if (!growthChart)
+        return;
+
+    const price =
+        document.getElementById(
+            "chkGrowthPrice"
+        );
+
+    const yieldBox =
+        document.getElementById(
+            "chkGrowthYoY"
+        );
+
+    const rsi =
+        document.getElementById(
+            "chkGrowthOpm"
+        );
+
+    growthChart
+        .data
+        .datasets[0]
+        .hidden =
+            !price.checked;
+
+    growthChart
+        .data
+        .datasets[1]
+        .hidden =
+            !yieldBox.checked;
+
+    growthChart
+        .data
+        .datasets[2]
+        .hidden =
+            !rsi.checked;
+
+    growthChart
+        .options
+        .scales
+        .y_price
+        .display =
+            price.checked;
+
+    growthChart
+        .options
+        .scales
+        .y_growth
+        .display =
+            yieldBox.checked ||
+            rsi.checked;
+
+    growthChart.update();
+}}
+
+
+/* ========================================================
+   초기 실행
+   ======================================================== */
+
+renderDividendChart();
+
+renderGrowthChart();
+
+</script>
+
 </body>
+
 </html>
 """
 
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"✅ [{data['name']}] v39.5 대시보드 렌더링 완료!")
+    # --------------------------------------------------------
+    # HTML 저장
+    # --------------------------------------------------------
+
+    try:
+
+        with open(
+            file_name,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                html_content
+            )
+
+    except Exception as e:
+
+        logging.warning(
+            f"HTML 파일 저장 실패: {e}"
+        )
+
+    print(
+        f"✅ [{data['name']}] "
+        f"v39.5 대시보드 렌더링 완료!"
+    )
+
     return html_content
 
 
-# ---------- Streamlit UI ----------
-st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
+# ============================================================
+# Streamlit UI
+# ============================================================
 
-st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-st.markdown("종목명 또는 코드를 입력하세요. **검색어가 포함된 모든 종목이 리스트로 표시됩니다.**")
+st.title(
+    "📊 종목별 맞춤형 동적 가중치 대시보드"
+)
 
-user_query = st.text_input("검색어 입력 (예: 삼성전자, 005930, 하이닉스, 부동산, 맥쿼리)", value="")
+st.markdown(
+    """
+### 🔎 종목 검색
+
+종목명 전체 또는 일부 단어를 입력하세요.
+
+예:
+
+- `부동산`
+- `리츠`
+- `삼성`
+- `하이닉스`
+- `반도체`
+- `커버드콜`
+- `005930`
+
+**검색어가 종목명에 포함된 모든 종목을 검색합니다.**
+"""
+)
+
+
+# ============================================================
+# 검색창
+# ============================================================
+
+user_query = st.text_input(
+    "🔎 종목 검색",
+    value="",
+    placeholder=(
+        "예: 부동산 / 리츠 / 삼성 / "
+        "하이닉스 / 반도체 / 005930"
+    )
+).strip()
+
+
+# ============================================================
+# 검색 실행
+# ============================================================
 
 if user_query:
-    user_query = user_query.strip()
+
     selected_code = None
     selected_name = None
 
-    # 1) 6자리 숫자 코드 입력
-    if user_query.isdigit() and len(user_query) == 6:
-        selected_code = user_query
-        # 종목명을 네이버에서 가져오기 시도
-        try:
-            url = f"https://finance.naver.com/item/main.naver?code={selected_code}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            name_elem = soup.select_one('.wrap_company h2 a')
-            if name_elem:
-                selected_name = name_elem.text.strip()
-        except Exception:
-            pass
-        if selected_name is None:
-            selected_name = selected_code  # fallback
+    # ========================================================
+    # 1. 6자리 종목코드 검색
+    # ========================================================
 
-    # 2) 종목명 부분 검색 (전체 종목 리스트에서)
-    else:
-        stock_list_df = get_all_stock_list()
-        if not stock_list_df.empty:
-            # 부분 문자열 검색 (대소문자 구분 없이)
-            matches = stock_list_df[stock_list_df['Name'].str.contains(user_query, case=False, na=False)]
-            if len(matches) == 0:
-                st.error("일치하는 종목이 없습니다. 검색어를 다시 확인해주세요.")
-            elif len(matches) == 1:
-                selected_code = matches.iloc[0]['Code']
-                selected_name = matches.iloc[0]['Name']
-            else:
-                # 여러 종목이 검색되면 리스트로 표시
-                st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(matches)}개)")
-                options = [f"{row['Name']} ({row['Code']})" for _, row in matches.iterrows()]
-                selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
-                if selected_option:
-                    code_part = selected_option.split('(')[-1].rstrip(')')
-                    selected_code = code_part
-                    selected_name = selected_option.split(' (')[0]
-        else:
-            # 전체 리스트 로딩 실패 시 네이버 자동완성으로 폴백
-            st.warning("전체 종목 리스트를 불러오지 못해 네이버 자동완성을 사용합니다.")
-            search_results = search_stock_list_naver(user_query)
-            if not search_results:
-                st.error("일치하는 종목이 없습니다.")
-            elif len(search_results) == 1:
-                selected_code = search_results[0]["code"]
-                selected_name = search_results[0]["name"]
-            else:
-                st.subheader(f"🔍 '{user_query}' 검색 결과 ({len(search_results)}개)")
-                options = [f"{item['name']} ({item['code']})" for item in search_results]
-                selected_option = st.selectbox("분석할 종목을 선택하세요:", options)
-                if selected_option:
-                    code_part = selected_option.split('(')[-1].rstrip(')')
-                    selected_code = code_part
-                    selected_name = selected_option.split(' (')[0]
+    if (
+        user_query.isdigit()
+        and len(user_query) <= 6
+    ):
 
-    # 3) 분석 실행
-    if selected_code and selected_name:
-        with st.spinner(f"'{selected_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
-            try:
-                html_str = generate_v39_dashboard(
-                    query=user_query,
-                    code=selected_code,
-                    name=selected_name
+        results = search_stock_list(
+            user_query,
+            max_results=20
+        )
+
+        if results:
+
+            st.subheader(
+                f"🔍 종목코드 검색 결과 "
+                f"({len(results)}개)"
+            )
+
+            options = [
+                f"{x['name']}  |  {x['code']}"
+                for x in results
+            ]
+
+            selected_option = st.selectbox(
+                "📌 분석할 종목 선택",
+                options,
+                key="stock_selector_code"
+            )
+
+            selected_idx = (
+                options.index(
+                    selected_option
                 )
-                if html_str:
-                    st.components.v1.html(html_str, height=1200, scrolling=True)
-                else:
-                    st.error("대시보드 생성에 실패했습니다.")
-            except Exception as e:
-                st.error(f"오류가 발생했습니다: {str(e)}")
+            )
+
+            selected_code = (
+                results[selected_idx]["code"]
+            )
+
+            selected_name = (
+                results[selected_idx]["name"]
+            )
+
+        else:
+
+            # ------------------------------------------------
+            # 네이버 직접 확인
+            # ------------------------------------------------
+
+            selected_code = (
+                user_query.zfill(6)
+            )
+
+            try:
+
+                url = (
+                    "https://finance.naver.com/"
+                    f"item/main.naver?code="
+                    f"{selected_code}"
+                )
+
+                res = requests.get(
+                    url,
+                    headers={
+                        "User-Agent":
+                            "Mozilla/5.0"
+                    },
+                    timeout=5
+                )
+
+                res.encoding = "cp949"
+
+                soup = BeautifulSoup(
+                    res.text,
+                    "html.parser"
+                )
+
+                name_elem = (
+                    soup.select_one(
+                        ".wrap_company h2 a"
+                    )
+                )
+
+                if name_elem:
+
+                    selected_name = (
+                        name_elem
+                        .text
+                        .strip()
+                    )
+
+            except Exception:
+                selected_name = None
+
+            if not selected_name:
+
+                st.error(
+                    "❌ 해당 종목코드를 "
+                    "찾지 못했습니다.\n\n"
+                    "종목코드를 확인해주세요."
+                )
+
+    # ========================================================
+    # 2. 종목명 / 부분검색
+    # ========================================================
+
+    else:
+
+        search_results = search_stock_list(
+            user_query,
+            max_results=200
+        )
+
+        # ----------------------------------------------------
+        # 검색 결과 없음
+        # ----------------------------------------------------
+
+        if not search_results:
+
+            st.warning(
+                f"⚠️ '{user_query}'가 "
+                "종목명에 포함된 종목을 "
+                "찾지 못했습니다."
+            )
+
+            st.info(
+                """
+                💡 검색 팁
+
+                종목명의 일부 단어만 입력해보세요.
+
+                예:
+                `부동산`
+                `리츠`
+                `삼성`
+                `하이닉스`
+                `반도체`
+                """
+            )
+
+        # ----------------------------------------------------
+        # 검색 결과 있음
+        # ----------------------------------------------------
+
+        else:
+
+            st.subheader(
+                f"🔍 '{user_query}' "
+                f"검색 결과 "
+                f"({len(search_results)}개)"
+            )
+
+            st.caption(
+                "종목명에 검색어가 포함된 "
+                "종목을 검색했습니다. "
+                "아래 목록에서 분석할 종목을 선택하세요."
+            )
+
+            # ------------------------------------------------
+            # SelectBox
+            # ------------------------------------------------
+
+            options = [
+                f"{item['name']}  |  {item['code']}"
+                for item in search_results
+            ]
+
+            selected_option = st.selectbox(
+                "📌 분석할 종목 선택",
+                options,
+                key=f"stock_selector_{user_query}"
+            )
+
+            selected_idx = (
+                options.index(
+                    selected_option
+                )
+            )
+
+            selected_code = (
+                search_results[
+                    selected_idx
+                ]["code"]
+            )
+
+            selected_name = (
+                search_results[
+                    selected_idx
+                ]["name"]
+            )
+
+            # ------------------------------------------------
+            # 선택된 종목 표시
+            # ------------------------------------------------
+
+            st.success(
+                f"선택된 종목: "
+                f"**{selected_name} "
+                f"({selected_code})**"
+            )
+
+            # ------------------------------------------------
+            # 검색 결과 테이블
+            # ------------------------------------------------
+
+            result_table = pd.DataFrame(
+                search_results
+            )
+
+            result_table = result_table[
+                ["code", "name"]
+            ].copy()
+
+            result_table.columns = [
+                "종목코드",
+                "종목명"
+            ]
+
+            st.dataframe(
+                result_table,
+                use_container_width=True,
+                hide_index=True,
+                height=min(
+                    500,
+                    35 * len(
+                        result_table
+                    ) + 45
+                )
+            )
+
+
+    # ========================================================
+    # 3. 분석 실행
+    # ========================================================
+
+    if (
+        selected_code
+        and selected_name
+    ):
+
+        st.divider()
+
+        st.markdown(
+            f"""
+            ### 📌 분석 대상
+
+            **{selected_name}**
+            `{selected_code}`
+            """
+        )
+
+        run_analysis = st.button(
+            "🚀 선택 종목 분석 실행",
+            type="primary",
+            use_container_width=True
+        )
+
+        if run_analysis:
+
+            with st.spinner(
+                f"'{selected_name}' "
+                "데이터를 수집하고 "
+                "대시보드를 생성하는 중입니다..."
+            ):
+
+                try:
+
+                    html_str = (
+                        generate_v39_dashboard(
+                            query=user_query,
+                            code=selected_code,
+                            name=selected_name
+                        )
+                    )
+
+                    if html_str:
+
+                        st.success(
+                            f"✅ "
+                            f"{selected_name} "
+                            "분석 완료"
+                        )
+
+                        components.html(
+                            html_str,
+                            height=1600,
+                            scrolling=True
+                        )
+
+                    else:
+
+                        st.error(
+                            "❌ 대시보드 생성에 "
+                            "실패했습니다."
+                        )
+
+                except Exception as e:
+
+                    logging.exception(
+                        "대시보드 생성 오류"
+                    )
+
+                    st.error(
+                        f"❌ 분석 중 오류가 "
+                        f"발생했습니다: {str(e)}"
+                    )
+
+
+# ============================================================
+# 검색창이 비어 있을 때
+# ============================================================
+
+else:
+
+    st.info(
+        """
+        👆 위 검색창에 종목명이나 일부 단어를 입력하세요.
+
+        예를 들어 **부동산**이라고 입력하면
+        종목명에 **부동산**이 포함된 종목을
+        모두 검색해서 선택할 수 있습니다.
+        """
+    )

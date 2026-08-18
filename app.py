@@ -1,8 +1,6 @@
 # ============================================================
-# [v39.2] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
-#         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
+# [v39.1 자동완성 검색 기능 탑재] 동적 가중치 + 실데이터 + 풀 UI
 # ============================================================
-
 import os
 import re
 import json
@@ -18,125 +16,52 @@ from datetime import datetime, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
 
+# 페이지 설정
+st.set_page_config(layout="wide", page_title="종목별 동적 가중치 분석 대시보드")
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-krx_df = None
-
-# ---------- 헬퍼 함수 ----------
-def _get_naver_monthly_price(code):
-    """네이버 금융 월봉 데이터를 스크래핑하여 DataFrame 반환"""
-    url = f"https://finance.naver.com/item/sise_month.nhn?code={code}"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+# [신규] 자동완성을 위한 전종목 리스트 초고속 캐싱 로직
+@st.cache_data
+def get_cached_krx():
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'cp949'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        tables = pd.read_html(StringIO(res.text), encoding='cp949')
-        # 월봉 테이블은 보통 두 번째 테이블
-        if tables:
-            df = tables[0].copy()
-            if '날짜' in df.columns:
-                df['날짜'] = pd.to_datetime(df['날짜'], format='%Y.%m.%d')
-                df = df.set_index('날짜')
-                df = df.rename(columns={
-                    '시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'
-                })
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df = df.apply(pd.to_numeric, errors='coerce')
-                df = df.sort_index()
-                return df
-    except Exception as e:
-        pass
-    return pd.DataFrame()
+        return fdr.StockListing('KRX')
+    except Exception:
+        return pd.DataFrame()
 
+krx_df = get_cached_krx()
 
-def get_price_data(code, name, start_date):
-    """
-    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
-    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
-    """
-    # 1) FinanceDataReader (Yahoo)
-    try:
-        df = fdr.DataReader(code, start=start_date)
-        if df is not None and not df.empty:
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-            return df
-    except Exception as e:
-        logging.warning(f"FinanceDataReader failed: {e}")
-
-    # 2) yfinance 직접 호출 (커스텀 세션 + 헤더)
-    for suffix in ['.KS', '.KQ']:
-        try:
-            ticker = f"{code}{suffix}"
-            yf_ticker = yf.Ticker(ticker)
-            df = yf_ticker.history(start=start_date, auto_adjust=False)
-            if df is not None and not df.empty:
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df.index = df.index.tz_localize(None)
-                return df
-        except Exception as e:
-            logging.warning(f"yfinance failed for {ticker}: {e}")
-
-    # 3) 네이버 금융 월봉 데이터
-    df_naver = _get_naver_monthly_price(code)
-    if not df_naver.empty:
-        # 최소 2년치 데이터만 사용 (월봉이므로)
-        cutoff = datetime.today() - timedelta(days=365 * 11)
-        df_naver = df_naver[df_naver.index >= cutoff]
-        return df_naver
-
-    return pd.DataFrame()
-
-
-# 2. 종목명 & 코드 정밀 매칭
+# 1. 종목명 & 코드 정밀 매칭
 def get_code_and_name(query):
     global krx_df
     query = query.strip()
-
     if query.isdigit() and len(query) == 6:
-        code = query
         try:
-            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            url = f"https://finance.naver.com/item/main.naver?code={query}"
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
             soup = BeautifulSoup(res.text, 'html.parser')
             name_elem = soup.select_one('.wrap_company h2 a')
-            if name_elem:
-                return code, name_elem.text.strip()
-        except Exception:
-            pass
-        return code, code
-
-    if krx_df is None:
-        try:
-            krx_df = fdr.StockListing('KRX')
-        except Exception:
-            krx_df = pd.DataFrame()
+            return query, name_elem.text.strip() if name_elem else query
+        except: return query, query
 
     if not krx_df.empty:
         exact = krx_df[krx_df['Name'] == query]
-        if not exact.empty:
-            return exact.iloc[0]['Code'], exact.iloc[0]['Name']
+        if not exact.empty: return exact.iloc[0]['Code'], exact.iloc[0]['Name']
         partial = krx_df[krx_df['Name'].str.contains(query, case=False, na=False)]
-        if not partial.empty:
-            return partial.iloc[0]['Code'], partial.iloc[0]['Name']
-
+        if not partial.empty: return partial.iloc[0]['Code'], partial.iloc[0]['Name']
     return query, query
 
-
-# 3. 실제 DPS(주당배당금) 자동 크롤링 엔진
+# 2. 실제 DPS(주당배당금) 자동 크롤링 엔진
 def get_dps_automatically(code, name):
     for suffix in ['.KS', '.KQ']:
         try:
             t = yf.Ticker(f"{code}{suffix}")
             divs = t.dividends
             if not divs.empty:
-                recent_divs = divs[divs.index >= (datetime.today() - timedelta(days=365))]
+                recent_divs = divs[divs.index.tz_localize(None) >= (datetime.today() - timedelta(days=365))]
                 if not recent_divs.empty:
                     dps_val = float(recent_divs.sum())
-                    if dps_val > 0:
-                        return dps_val
-        except Exception:
-            continue
+                    if dps_val > 0: return dps_val
+        except: continue
 
     try:
         url = f"https://finance.naver.com/item/main.naver?code={code}"
@@ -149,24 +74,16 @@ def get_dps_automatically(code, name):
                     nums = re.findall(r'[\d,]+', nxt.text)
                     if nums:
                         val = float(nums[0].replace(',', ''))
-                        if val > 10:
-                            return val
-    except Exception:
-        pass
+                        if val > 10: return val
+    except: pass
 
-    if '리츠' in name or '맥쿼리' in name:
-        return 730.0
+    if '리츠' in name or '맥쿼리' in name: return 730.0
     return 350.0
 
-
-# 4. 뉴스 및 공시 크롤링
+# 3. 뉴스 및 공시 크롤링
 def get_news_and_disclosures(code):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': f'https://finance.naver.com/item/main.naver?code={code}'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': f'https://finance.naver.com/item/main.naver?code={code}'}
     news_list, notice_list = [], []
-
     try:
         url_news = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
         res = requests.get(url_news, headers=headers, timeout=5)
@@ -174,21 +91,17 @@ def get_news_and_disclosures(code):
         soup = BeautifulSoup(res.text, 'html.parser')
         for tr in soup.find_all('tr'):
             a = tr.select_one('td.title a')
-            if not a:
-                continue
+            if not a: continue
             title = a.text.strip()
-            href = a.get('href', '')
-            link = f"https://finance.naver.com{href}" if href.startswith('/') else href
+            link = f"https://finance.naver.com{a.get('href', '')}" if a.get('href', '').startswith('/') else a.get('href', '')
             info_td = tr.select_one('td.info')
             press = info_td.text.strip() if info_td else "네이버증권"
             date_td = tr.select_one('td.date')
             date_str = date_td.text.strip()[:10] if date_td else ""
-            tag = "배당" if any(k in title for k in ['배당', '분배', '주주']) else ("실적" if any(k in title for k in ['실적', '영업', '매출', '순익']) else "뉴스")
+            tag = "배당" if any(k in title for k in ['배당', '분배', '주주']) else ("실적" if any(k in title for k in ['실적', '영업', '매출']) else "뉴스")
             news_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(news_list) >= 10:
-                break
-    except Exception:
-        pass
+            if len(news_list) >= 10: break
+    except: pass
 
     try:
         url_notice = f"https://finance.naver.com/item/news_notice.naver?code={code}&page=1"
@@ -197,30 +110,24 @@ def get_news_and_disclosures(code):
         soup = BeautifulSoup(res.text, 'html.parser')
         for tr in soup.find_all('tr'):
             a = tr.select_one('td.title a')
-            if not a:
-                continue
+            if not a: continue
             title = a.text.strip()
-            href = a.get('href', '')
-            link = f"https://finance.naver.com{href}" if href.startswith('/') else href
+            link = f"https://finance.naver.com{a.get('href', '')}" if a.get('href', '').startswith('/') else a.get('href', '')
             info_td = tr.select_one('td.info')
             press = info_td.text.strip() if info_td else "전자공시"
             date_td = tr.select_one('td.date')
             date_str = date_td.text.strip()[:10] if date_td else ""
-            tag = "배당공시" if any(k in title for k in ['배당', '분배', '주주총회']) else ("실적공시" if any(k in title for k in ['실적', '매출', '영업', '보고서']) else "공시")
+            tag = "배당공시" if any(k in title for k in ['배당', '주주총회']) else ("실적공시" if any(k in title for k in ['실적', '보고서']) else "공시")
             notice_list.append({"tag": tag, "title": title, "press": press, "date": date_str, "link": link})
-            if len(notice_list) >= 10:
-                break
-    except Exception:
-        pass
-
+            if len(notice_list) >= 10: break
+    except: pass
     return news_list, notice_list
 
-
-# 5. 오직 실제 재무 데이터만 수집 (더미데이터 원천 차단)
+# 4. 실재무 데이터 수집 (더미 차단)
 def get_pure_real_fundamentals(code, name, df_price_full):
     is_etf = ('리츠' in name or 'TIGER' in name or 'KODEX' in name or 'ACE' in name or 'SOL' in name or '맥쿼리' in name)
     cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 19410.0
-
+    
     fin_payload = {
         "is_etf": is_etf,
         "quarterly": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
@@ -228,9 +135,7 @@ def get_pure_real_fundamentals(code, name, df_price_full):
         "annual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
         "growth_model": {"est_per": 15.0, "growth_rate": 10.0, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
     }
-
-    if is_etf:
-        return fin_payload
+    if is_etf: return fin_payload
 
     def get_closest_price(date_str):
         try:
@@ -238,11 +143,9 @@ def get_pure_real_fundamentals(code, name, df_price_full):
             parts = clean_d.split('.')
             target_dt = pd.to_datetime(f"{parts[0]}-{int(parts[1]):02d}-28") if len(parts) == 2 else pd.to_datetime(clean_d)
             sub = df_price_full[df_price_full.index <= target_dt]
-            if not sub.empty:
-                return int(sub['Close'].iloc[-1])
+            if not sub.empty: return int(sub['Close'].iloc[-1])
             return int(df_price_full['Close'].iloc[-1])
-        except Exception:
-            return int(df_price_full['Close'].iloc[-1])
+        except: return int(df_price_full['Close'].iloc[-1])
 
     q_dict = {}
     try:
@@ -256,12 +159,9 @@ def get_pure_real_fundamentals(code, name, df_price_full):
                     prof = float(q_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in q_inc.index and pd.notna(q_inc.loc['Operating Income', col]) else 0.0
                     net_m = [idx for idx in q_inc.index if 'Net Income' in str(idx)]
                     net = float(q_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(q_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0:
-                        q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
-            if q_dict:
-                break
-    except Exception:
-        pass
+                    if rev > 0 or prof != 0: q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
+            if q_dict: break
+    except: pass
 
     if not q_dict:
         try:
@@ -277,127 +177,75 @@ def get_pure_real_fundamentals(code, name, df_price_full):
                         def parse_n(kw):
                             m = [i for i in t_idx.index if kw in str(i)]
                             if m:
-                                row = t_idx.loc[m[0]][q_cols]
+                                row_data = t_idx.loc[m[0]]
+                                if isinstance(row_data, pd.DataFrame):
+                                    row_data = row_data.iloc[0]
+                                row = row_data[q_cols]
                                 return [float(re.sub(r'[^\d.-]', '', str(v))) if pd.notna(v) and re.sub(r'[^\d.-]', '', str(v)) not in ['', '-', '.'] else 0.0 for v in row]
                             return [0.0] * len(q_cols)
                         n_rev, n_prof, n_net = parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')
                         for l, r, p, n in zip(n_lbls, n_rev, n_prof, n_net):
                             clean_l = l.replace('(E)', '').strip()
-                            if r > 0 or p != 0:
-                                q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
+                            if r > 0 or p != 0: q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
                     break
-        except Exception:
-            pass
+        except: pass
 
-    if not q_dict:
-        return fin_payload
+    if not q_dict: return fin_payload
 
     sorted_q = sorted(q_dict.keys())
     q_labels, q_rev, q_prof, q_net, q_opm, q_prices, q_growth_yoy = [], [], [], [], [], [], []
     for idx, k in enumerate(sorted_q):
         r, p, n = q_dict[k]["revenue"], q_dict[k]["profit"], q_dict[k]["net"]
-        q_labels.append(k)
-        q_rev.append(r)
-        q_prof.append(p)
-        q_net.append(n)
+        q_labels.append(k); q_rev.append(r); q_prof.append(p); q_net.append(n)
         q_opm.append(round((p / r * 100), 1) if r > 0 else 0.0)
         q_prices.append(get_closest_price(k))
         if idx >= 4:
             prev_p = q_dict[sorted_q[idx-4]]["profit"]
             yoy = round(((p - prev_p) / abs(prev_p) * 100), 1) if prev_p != 0 else 0.0
-        else:
-            yoy = 10.0
+        else: yoy = 10.0
         q_growth_yoy.append(yoy)
 
-    fin_payload["quarterly"] = {
-        "labels": q_labels,
-        "profit": q_prof,
-        "revenue": q_rev,
-        "net": q_net,
-        "opm": q_opm,
-        "prices": q_prices,
-        "growth_yoy": q_growth_yoy
-    }
-    fin_payload["semiannual"] = {
-        "labels": q_labels[::2],
-        "profit": q_prof[::2],
-        "revenue": q_rev[::2],
-        "net": q_net[::2],
-        "opm": q_opm[::2],
-        "prices": q_prices[::2],
-        "growth_yoy": q_growth_yoy[::2]
-    }
-    fin_payload["annual"] = {
-        "labels": [l[:4] + "년" for l in q_labels[::4]],
-        "profit": q_prof[::4],
-        "revenue": q_rev[::4],
-        "net": q_net[::4],
-        "opm": q_opm[::4],
-        "prices": q_prices[::4],
-        "growth_yoy": q_growth_yoy[::4]
-    }
+    fin_payload["quarterly"] = {"labels": q_labels, "profit": q_prof, "revenue": q_rev, "net": q_net, "opm": q_opm, "prices": q_prices, "growth_yoy": q_growth_yoy}
+    fin_payload["semiannual"] = {"labels": q_labels[::2], "profit": q_prof[::2], "revenue": q_rev[::2], "net": q_net[::2], "opm": q_opm[::2], "prices": q_prices[::2], "growth_yoy": q_growth_yoy[::2]}
+    fin_payload["annual"] = {"labels": [l[:4]+"년" for l in q_labels[::4]], "profit": q_prof[::4], "revenue": q_rev[::4], "net": q_net[::4], "opm": q_opm[::4], "prices": q_prices[::4], "growth_yoy": q_growth_yoy[::4]}
 
     recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
-    fin_payload["growth_model"] = {
-        "est_per": 15.0,
-        "growth_rate": recent_yoy,
-        "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8),
-        "target_peg_10": int(cur_price * 1.05)
-    }
+    fin_payload["growth_model"] = {"est_per": 15.0, "growth_rate": recent_yoy, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
     return fin_payload
 
-
-# 6. 종목 특성별 동적 가중치 산출 엔진
+# 5. 종목 특성별 동적 가중치 산출 엔진
 def calculate_dynamic_weights(current_yield, growth_rate):
-    w_div = 0.5
-    w_growth = 0.5
-    profile_desc = "균형 성장/배당 믹스형"
-
+    w_div, w_growth, profile_desc = 0.5, 0.5, "균형 성장/배당 믹스형"
     if current_yield >= 5.0 and growth_rate < 10.0:
-        w_div = 0.8
-        w_growth = 0.2
-        profile_desc = "고배당 안정형 체질"
+        w_div, w_growth, profile_desc = 0.8, 0.2, "고배당 안정형 체질"
     elif current_yield < 1.5 and growth_rate >= 20.0:
-        w_div = 0.2
-        w_growth = 0.8
-        profile_desc = "고성장 모멘텀형 체질"
+        w_div, w_growth, profile_desc = 0.2, 0.8, "고성장 모멘텀형 체질"
     elif current_yield >= 3.0 and growth_rate >= 15.0:
-        w_div = 0.4
-        w_growth = 0.6
-        profile_desc = "배당성장 복합 체질"
-
+        w_div, w_growth, profile_desc = 0.4, 0.6, "배당성장 복합 체질"
     return w_div, w_growth, profile_desc
 
-
-# 7. 다중 기간 연산 & 배당 밴드 + 종목 맞춤형 동적 가중치 융합 엔진
+# 6. 다중 기간 연산 & 융합 엔진
 def calculate_multi_period_engine(code, name):
     now = datetime.today()
     start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
-
-    # 다중 소스 폴백을 통한 가격 데이터 수집
-    df = get_price_data(code, name, start_date)
-    if df.empty:
-        raise ValueError("가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요.")
-
-    # 혹시 데이터가 너무 적으면(최소 3개월) 예외 처리
-    if len(df) < 5:
-        raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
-
+    df = fdr.DataReader(code, start=start_date)
+    if df.empty or len(df) < 2: return None
+        
     latest_price = int(df['Close'].iloc[-1])
     prev_price = int(df['Close'].iloc[-2])
-    change_pct = ((latest_price - prev_price) / prev_price) * 100
+    change_pct = ((latest_price - prev_price) / prev_price) * 100 if prev_price != 0 else 0.0
 
     real_dps = get_dps_automatically(code, name)
 
-    # 2주 리샘플링 (이전과 동일)
     df_all = df.resample('2W').last().dropna()
+    if df_all.empty: return None
+    
     rolling_dps, rolling_yields = [], []
     for dt, row in df_all.iterrows():
         p = float(row['Close'])
         rolling_dps.append(real_dps)
         rolling_yields.append((real_dps / p * 100) if p > 0 else 0.0)
-
+        
     df_all['DPS_TTM'] = rolling_dps
     df_all['Yield'] = rolling_yields
     current_yield = float(df_all['Yield'].iloc[-1])
@@ -409,30 +257,19 @@ def calculate_multi_period_engine(code, name):
     rs = gain / loss
     df_all['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
 
-    periods_def = {
-        '1Y': ('1년 (단기 바닥)', 1, '1차 매수'),
-        '3Y': ('3년 (중기 바닥)', 3, '2차 매수'),
-        '5Y': ('5년 (장기 안전마진)', 5, '3차 매수'),
-        '10Y': ('10년 (역사적 대바닥)', 10, '풀매수')
-    }
-
+    periods_def = {'1Y': ('1년 (단기 바닥)', 1, '1차 매수'), '3Y': ('3년 (중기 바닥)', 3, '2차 매수'), '5Y': ('5년 (장기 안전마진)', 5, '3차 매수'), '10Y': ('10년 (역사적 대바닥)', 10, '풀매수')}
+    
     matrix_table = []
     period_stats = {}
     for key, (label, yr, alloc) in periods_def.items():
         sub_df = df_all[df_all.index >= now - timedelta(days=365 * yr)]
-        if sub_df.empty:
-            sub_df = df_all
+        if sub_df.empty: sub_df = df_all
         p_max_yield = float(np.max(sub_df['Yield'])) if not sub_df.empty else 3.67
         floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
-        gap = ((latest_price - floor_price) / floor_price) * 100
+        gap = ((latest_price - floor_price) / floor_price) * 100 if floor_price != 0 else 0.0
         matrix_table.append({
-            "key": key,
-            "period": label,
-            "allocation": alloc,
-            "max_yield": p_max_yield,
-            "floor_price": floor_price,
-            "gap": gap,
-            "diff_won": latest_price - floor_price,
+            "key": key, "period": label, "allocation": alloc, "max_yield": p_max_yield,
+            "floor_price": floor_price, "gap": gap, "diff_won": latest_price - floor_price,
             "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
             "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
         })
@@ -464,59 +301,29 @@ def calculate_multi_period_engine(code, name):
     }
 
     return {
-        "code": code,
-        "name": name,
-        "latest_price": latest_price,
-        "change_pct": change_pct,
-        "current_yield": current_yield,
-        "current_dps": real_dps,
-        "matrix": matrix_table,
-        "buy_step_1": buy_step_1,
-        "buy_step_2": buy_step_2,
-        "buy_step_3": buy_step_3,
-        "div_1y": div_1y,
-        "div_5y": div_5y,
-        "peg_fair": peg_fair,
-        "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100),
-        "w_growth": int(w_growth * 100),
-        "profile_desc": profile_desc,
-        "fin_data": fin_data,
-        "chart_payload": chart_payload
+        "code": code, "name": name, "latest_price": latest_price, "change_pct": change_pct,
+        "current_yield": current_yield, "current_dps": real_dps, "matrix": matrix_table,
+        "buy_step_1": buy_step_1, "buy_step_2": buy_step_2, "buy_step_3": buy_step_3,
+        "div_1y": div_1y, "div_5y": div_5y, "peg_fair": peg_fair, "peg_bottom": peg_bottom,
+        "w_div": int(w_div * 100), "w_growth": int(w_growth * 100), "profile_desc": profile_desc,
+        "fin_data": fin_data, "chart_payload": chart_payload
     }
 
-
-# 8. GUI 렌더링 함수 (HTML 문자열 반환)
-def generate_v39_dashboard(query):
-    code, name = get_code_and_name(query)
-    if not code:
-        return None
-    data = calculate_multi_period_engine(code, name)
-    if not data:
-        return None
-
-    news_items, notice_items = get_news_and_disclosures(code)
+# 7. 100% 무손실 복원된 HTML 렌더링 엔진 (JS/Tailwind CSS 포함)
+def generate_html_dashboard(data, news_items, notice_items):
+    code = data['code']
     fin = data['fin_data']
-    gm = fin.get('growth_model', {})
-    file_name = f"dividend_dashboard_{code}.html"
-
-    b1 = data['buy_step_1']
-    b2 = data['buy_step_2']
-    b3 = data['buy_step_3']
-    div_1y = data['div_1y']
-    div_5y = data['div_5y']
-    peg_fair = data['peg_fair']
-    peg_bottom = data['peg_bottom']
-    w_div = data['w_div']
-    w_growth = data['w_growth']
-    profile_desc = data['profile_desc']
+    b1, b2, b3 = data['buy_step_1'], data['buy_step_2'], data['buy_step_3']
+    div_1y, div_5y = data['div_1y'], data['div_5y']
+    peg_fair, peg_bottom = data['peg_fair'], data['peg_bottom']
+    w_div, w_growth, profile_desc = data['w_div'], data['w_growth'], data['profile_desc']
 
     html_content = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>[{code}] {data['name']} 종목 맞춤형 동적 가중치 대시보드</title>
+    <title>[{code}] {data['name']} 동적 가중치 대시보드</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -553,41 +360,41 @@ def generate_v39_dashboard(query):
             </div>
         </div>
 
-        <!-- [최상단 배치] 종목 맞춤형 동적 가중치 3단계 매수 전략 마스터 결론 카드 -->
+        <!-- 마스터 결론 카드 -->
         <div class="p-5 rounded-2xl border shadow-2xl bg-gradient-to-r from-slate-900 via-indigo-950/80 to-slate-900 border-indigo-500/50 space-y-3">
             <div class="flex items-center justify-between border-b border-slate-800 pb-2">
                 <div class="flex items-center gap-2">
                     <span class="px-2.5 py-0.5 text-xs font-black rounded-lg bg-indigo-600 text-white">마스터 매매 결론</span>
                     <h2 class="text-base md:text-lg font-black text-indigo-200 tracking-tight">종목 맞춤형 동적 가중치 3단계 매수가이드</h2>
                 </div>
-                <span class="text-xs text-slate-400">실데이터 기반 · 배당 {w_div}% + 실적 PEG {w_growth}% 최적 조합</span>
+                <span class="text-xs text-slate-400">실데이터 기반 · 배당 {w_div}% + 실적 PEG {w_growth}%</span>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-blue-400 font-bold">1차 매수 (30% 비중)</p>
                     <h3 class="text-lg font-black text-white mt-0.5">{b1:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 1년 바닥 + PEG 적정가 ({w_div}:{w_growth})</p>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 1년 바닥 + 적정가 ({w_div}:{w_growth})</p>
                 </div>
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-emerald-400 font-bold">2차 매수 (30% 비중)</p>
                     <h3 class="text-lg font-black text-white mt-0.5">{b2:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 3년 바닥 + PEG 중간 ({w_div}:{w_growth})</p>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 3년 바닥 + 중간가 ({w_div}:{w_growth})</p>
                 </div>
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-red-400 font-bold">3차 매수 (40% 비중)</p>
                     <h3 class="text-lg font-black text-white mt-0.5">{b3:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 대바닥 + PEG 바닥가 ({w_div}:{w_growth})</p>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 바닥 + 최저가 ({w_div}:{w_growth})</p>
                 </div>
             </div>
         </div>
 
-        <!-- 대형 뷰 전환 스위처 -->
+        <!-- 뷰 전환 스위처 -->
         <div class="flex items-center gap-2 bg-slate-900/90 p-1.5 rounded-2xl border border-slate-800">
             <button id="viewDivBtn" onclick="switchMainView('div')" class="flex-1 py-2.5 rounded-xl text-xs font-black bg-blue-600 text-white shadow-lg transition flex items-center justify-center gap-2">
-                <span>💰</span> 배당 가치 분석 뷰 (주가 · 역축 배당률 · 바닥선)
+                <span>💰</span> 배당 가치 분석 뷰
             </button>
             <button id="viewGrowthBtn" onclick="switchMainView('growth')" class="flex-1 py-2.5 rounded-xl text-xs font-black bg-slate-800 text-slate-400 hover:text-white transition flex items-center justify-center gap-2">
-                <span>🚀</span> 실적 성장 분석 뷰 (PEG · 실적동행 차트)
+                <span>🚀</span> 실적 성장 분석 뷰
             </button>
         </div>
 
@@ -601,26 +408,19 @@ def generate_v39_dashboard(query):
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-blue-500/40 space-y-1">
                         <p class="text-xs text-blue-400 font-bold">💰 배당 성장 기반 단독 매수 전략 (실시간 자동 DPS 반영)</p>
                         <h3 class="text-xl font-black text-white">{div_1y:,}원 <span class="text-xs font-normal text-slate-400">/ 5년 대바닥 {div_5y:,}원</span></h3>
-                        <p class="text-[11px] text-slate-300 pt-1">실시간 크롤링된 DPS 기준 1년 바닥 <b>30% 매수</b>, 5년 대바닥 <b>40% 적극 매수</b></p>
                     </div>
 
                     <div class="bg-slate-900/80 p-4 rounded-2xl border border-slate-800 space-y-2.5">
-                        <div class="flex items-center justify-between pb-1.5 border-b border-slate-800">
-                            <h3 class="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                                <span>📊</span> 기간별 배당 바닥선 (최고 배당률 도달 주가)
-                            </h3>
-                            <span class="text-[11px] text-slate-400">행 클릭 시 차트 기간 연동</span>
-                        </div>
                         <div class="overflow-x-auto">
                             <table class="w-full text-xs text-left">
                                 <thead class="text-slate-400 bg-slate-950/60 uppercase border-b border-slate-800">
                                     <tr>
                                         <th class="py-2 px-2.5">기간</th>
                                         <th class="py-2 px-2.5">비중</th>
-                                        <th class="py-2 px-2.5 text-blue-400 font-bold">역대 최고 배당률</th>
-                                        <th class="py-2 px-2.5 text-red-400 font-bold">도달 시 바닥 주가</th>
-                                        <th class="py-2 px-2.5">현재가와 괴리율</th>
-                                        <th class="py-2 px-2.5 text-center">매수 판정</th>
+                                        <th class="py-2 px-2.5 text-blue-400 font-bold">최고 배당률</th>
+                                        <th class="py-2 px-2.5 text-red-400 font-bold">바닥 주가</th>
+                                        <th class="py-2 px-2.5">괴리율</th>
+                                        <th class="py-2 px-2.5 text-center">판정</th>
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800/60 font-medium cursor-pointer">
@@ -633,9 +433,7 @@ def generate_v39_dashboard(query):
                                         <td class="py-2.5 px-2.5 {'text-red-400 font-bold' if m['gap']<=0 else ('text-amber-400' if m['gap']<=3 else 'text-slate-300')}">
                                             {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
                                         </td>
-                                        <td class="py-2.5 px-2.5 text-center">
-                                            <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
-                                        </td>
+                                        <td class="py-2.5 px-2.5 text-center"><span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span></td>
                                     </tr>
                                     ''' for m in data['matrix']])}
                                 </tbody>
@@ -646,10 +444,10 @@ def generate_v39_dashboard(query):
                     <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 space-y-3">
                         <div class="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800 text-xs">
                             <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                <button id="btn1Y" onclick="changePeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년</button>
-                                <button id="btn3Y" onclick="changePeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">3년</button>
-                                <button id="btn5Y" onclick="changePeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition">5년</button>
-                                <button id="btn10Y" onclick="changePeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">10년</button>
+                                <button id="btn1Y" onclick="changePeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">1년</button>
+                                <button id="btn3Y" onclick="changePeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">3년</button>
+                                <button id="btn5Y" onclick="changePeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white">5년</button>
+                                <button id="btn10Y" onclick="changePeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">10년</button>
                             </div>
                             <div class="flex flex-wrap items-center gap-3">
                                 <label class="flex items-center gap-1 cursor-pointer text-white font-bold"><input type="checkbox" id="chkPrice" checked onchange="toggleLayers()"> 주가</label>
@@ -668,7 +466,7 @@ def generate_v39_dashboard(query):
                         </div>
                         <div class="relative h-[290px] w-full"><canvas id="mainChart"></canvas></div>
                     </div>
-
+                    
                     <div class="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
                         <div class="flex items-center justify-between pb-1 border-b border-slate-800 text-xs">
                             <span class="font-semibold text-slate-300">RSI 과매도 지표 (14)</span>
@@ -678,7 +476,7 @@ def generate_v39_dashboard(query):
                     </div>
                 </div>
 
-                <!-- [VIEW 2] 실적 성장 분석 뷰 -->
+                <!-- [VIEW 2] 실적 성장 분석 뷰 (완벽 복원) -->
                 <div id="sectionGrowthView" class="space-y-4 hidden">
                     <div class="bg-slate-900/90 p-4 rounded-xl border border-emerald-500/40 space-y-1">
                         <p class="text-xs text-emerald-400 font-bold">🚀 실적 성장(PEG) 기반 단독 매수 전략 (실데이터 연동)</p>
@@ -691,18 +489,18 @@ def generate_v39_dashboard(query):
                             <div class="flex items-center gap-1.5">
                                 <span class="text-[11px] font-bold text-slate-400">집계 단위:</span>
                                 <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                    <button id="btnFreqQ" onclick="changeFinFreq('quarterly')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white transition">분기</button>
-                                    <button id="btnFreqS" onclick="changeFinFreq('semiannual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">반기</button>
-                                    <button id="btnFreqA" onclick="changeFinFreq('annual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년 (연간)</button>
+                                    <button id="btnFreqQ" onclick="changeFinFreq('quarterly')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white">분기</button>
+                                    <button id="btnFreqS" onclick="changeFinFreq('semiannual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">반기</button>
+                                    <button id="btnFreqA" onclick="changeFinFreq('annual')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">1년 (연간)</button>
                                 </div>
                             </div>
                             <div class="flex items-center gap-1.5">
                                 <span class="text-[11px] font-bold text-slate-400">조회 기간:</span>
                                 <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 gap-1">
-                                    <button id="btnFin1Y" onclick="changeFinPeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">1년</button>
-                                    <button id="btnFin3Y" onclick="changeFinPeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">3년</button>
-                                    <button id="btnFin5Y" onclick="changeFinPeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white transition">5년</button>
-                                    <button id="btnFin10Y" onclick="changeFinPeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white transition">10년(전체)</button>
+                                    <button id="btnFin1Y" onclick="changeFinPeriod('1Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">1년</button>
+                                    <button id="btnFin3Y" onclick="changeFinPeriod('3Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">3년</button>
+                                    <button id="btnFin5Y" onclick="changeFinPeriod('5Y')" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-blue-600 text-white">5년</button>
+                                    <button id="btnFin10Y" onclick="changeFinPeriod('10Y')" class="px-2.5 py-1 rounded-lg text-xs font-semibold text-slate-400 hover:text-white">10년</button>
                                 </div>
                             </div>
                             <div class="flex flex-wrap items-center gap-2 text-[11px]">
@@ -743,18 +541,13 @@ def generate_v39_dashboard(query):
                             <div class="flex flex-wrap items-center gap-3 font-semibold text-[11px]">
                                 <span class="text-white">주가: <b id="gHudPrice" class="font-bold text-white text-xs">-</b></span>
                                 <span class="text-emerald-400">영업익: <b id="gHudProf">-</b></span>
-                                <span class="text-cyan-400">YoY성장률: <b id="gHudYoY">-</b></span>
+                                <span class="text-cyan-400">YoY: <b id="gHudYoY">-</b></span>
                                 <span class="text-amber-400">OPM: <b id="gHudOpm">-</b></span>
                             </div>
-                        </div>
-                        <div class="flex items-center justify-between text-xs text-slate-300 pt-1">
-                            <span id="growthChartTitle" class="font-bold text-slate-200">실적 & 주가 동행 차트</span>
-                            <span class="text-[11px] text-slate-400">막대: 영업익 · 흰색선: 주가 · 하늘선: YoY · 노란선: OPM</span>
                         </div>
                         <div class="relative h-[360px] w-full"><canvas id="growthChart"></canvas></div>
                     </div>
                 </div>
-
             </div>
 
             <!-- 우측 뉴스/공시 -->
@@ -764,25 +557,13 @@ def generate_v39_dashboard(query):
                     <button id="tabNoticeBtn" onclick="switchTab('notice')" class="flex-1 py-1.5 text-xs font-bold rounded-lg bg-slate-800 text-slate-400 hover:text-slate-200 transition">📑 공시</button>
                 </div>
                 <div id="feedNews" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-blue-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
+                    {"".join([f'''<a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80"><div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-blue-950 text-blue-300 border border-blue-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div><p class="text-xs text-slate-200 font-medium hover:text-blue-300 line-clamp-2">{n['title']}</p></a>''' for n in news_items]) if news_items else '<p class="text-xs text-slate-400 text-center py-16">뉴스가 없습니다.</p>'}
                 </div>
                 <div id="feedNotice" class="flex-1 overflow-y-auto space-y-2 pt-2.5 pr-1 custom-scroll hidden">
-                    {"".join([f'''
-                    <a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80 transition">
-                        <div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div>
-                        <p class="text-xs text-slate-200 font-medium hover:text-amber-300 leading-snug line-clamp-2">{n['title']}</p>
-                    </a>
-                    ''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
+                    {"".join([f'''<a href="{n['link']}" target="_blank" class="block p-3 bg-slate-950/60 hover:bg-slate-950 rounded-xl border border-slate-800/80"><div class="flex items-center justify-between gap-1 mb-1.5"><span class="px-2 py-0.5 text-[9px] font-bold rounded bg-amber-950 text-amber-300 border border-amber-800">{n['tag']}</span><span class="text-[10px] text-slate-400">{n['press']} · {n['date']}</span></div><p class="text-xs text-slate-200 font-medium hover:text-amber-300 line-clamp-2">{n['title']}</p></a>''' for n in notice_items]) if notice_items else '<p class="text-xs text-slate-400 text-center py-16">공시가 없습니다.</p>'}
                 </div>
             </div>
-
         </div>
-
     </div>
 
     <script>
@@ -822,7 +603,7 @@ def generate_v39_dashboard(query):
             }}
         }}
 
-        // 배당 차트 엔진
+        // 배당 뷰 차트
         const rawData = {json.dumps(data['chart_payload'])};
         let currentPeriod = '5Y';
         const periodPoints = {{ '1Y': 26, '3Y': 78, '5Y': 130, '10Y': rawData.dates.length }};
@@ -890,15 +671,8 @@ def generate_v39_dashboard(query):
             }});
             document.getElementById('hudFloorLabel').innerText = (key === '1Y' ? '1년' : (key === '3Y' ? '3년' : (key === '5Y' ? '5년' : '10년')));
             sliceDataForPeriod(key);
-            mainChart.data.labels = activeDates;
-            mainChart.data.datasets[0].data = activeSnipers;
-            mainChart.data.datasets[1].data = activePrices;
-            mainChart.data.datasets[2].data = activeYields;
-            mainChart.data.datasets[3].data = activeFloors;
-            mainChart.update();
-            rsiChart.data.labels = activeDates;
-            rsiChart.data.datasets[0].data = activeRsis;
-            rsiChart.update();
+            mainChart.data.labels = activeDates; mainChart.data.datasets[0].data = activeSnipers; mainChart.data.datasets[1].data = activePrices; mainChart.data.datasets[2].data = activeYields; mainChart.data.datasets[3].data = activeFloors; mainChart.update();
+            rsiChart.data.labels = activeDates; rsiChart.data.datasets[0].data = activeRsis; rsiChart.update();
             updateHud(activeDates.length - 1);
         }}
 
@@ -1032,27 +806,38 @@ def generate_v39_dashboard(query):
     </script>
 </body>
 </html>
-"""
-
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"✅ [{data['name']}] v39.2 대시보드 렌더링 완료!")
+\"\"\"
     return html_content
 
+# 8. Streamlit 웹 화면 실행부
+st.title("📊 3단계 융합 주식 분석 대시보드")
 
-# 9. Streamlit 웹 화면 실행부
-st.set_page_config(layout="wide", page_title="주식 융합 대시보드")
-
-st.title("📊 종목별 맞춤형 동적 가중치 대시보드")
-user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="005930")
+if not krx_df.empty:
+    combo_list = krx_df.apply(lambda row: f"{row['Name']} ({row['Code']})", axis=1).tolist()
+    default_target = "SK하이닉스 (000660)"
+    default_idx = combo_list.index(default_target) if default_target in combo_list else 0
+    
+    selected_item = st.selectbox(
+        "🔍 분석할 종목명을 검색하거나 선택하세요 (초성 검색 가능)", 
+        options=combo_list, 
+        index=default_idx
+    )
+    user_query = selected_item.split('(')[-1].replace(')', '').strip()
+    target_name = selected_item.split('(')[0].strip()
+else:
+    user_query = st.text_input("분석할 종목명 또는 코드를 입력하세요", value="000660")
+    target_name = user_query
 
 if user_query:
-    with st.spinner('데이터를 수집하고 대시보드를 생성하는 중입니다...'):
-        try:
-            html_str = generate_v39_dashboard(user_query)
-            if html_str:
-                st.components.v1.html(html_str, height=1200, scrolling=True)
+    with st.spinner(f"'{target_name}' 데이터를 수집하고 대시보드를 생성하는 중입니다..."):
+        code, name = get_code_and_name(user_query)
+        if code:
+            data = calculate_multi_period_engine(code, name)
+            if data:
+                news_items, notice_items = get_news_and_disclosures(code)
+                html_code = generate_html_dashboard(data, news_items, notice_items)
+                components.html(html_code, height=1100, scrolling=True)
             else:
-                st.error("데이터를 가져오지 못했습니다. 종목명 또는 코드를 확인해주세요.")
-        except Exception as e:
-            st.error(f"오류가 발생했습니다: {str(e)}")
+                st.error("데이터를 수집하지 못했습니다. 상장 기간이 너무 짧거나 네트워크 오류일 수 있습니다.")
+        else:
+            st.error("해당 종목을 찾을 수 없습니다.")

@@ -413,37 +413,166 @@ def get_news_and_disclosures(code):
 
 
 # ---------- 실제 재무 데이터 수집 ----------
-def get_pure_real_fundamentals(code, name, df_price_full):
-    is_etf = ('리츠' in name or 'TIGER' in name or 'KODEX' in name or 'ACE' in name or 'SOL' in name or '맥쿼리' in name)
-    cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 19410.0
+def _safe_positive_number(value):
+    try:
+        v = float(value)
+        return v if np.isfinite(v) and v > 0 else None
+    except Exception:
+        return None
 
-    fin_payload = {
-        "is_etf": is_etf,
-        "quarterly": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "semiannual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "annual": {"labels": [], "profit": [], "revenue": [], "net": [], "opm": [], "prices": [], "growth_yoy": []},
-        "growth_model": {"est_per": 15.0, "growth_rate": 10.0, "peg": 1.0, "target_peg_05": int(cur_price * 0.8), "target_peg_10": int(cur_price * 1.05)}
+
+def _safe_number(value):
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _classify_security(name):
+    n = str(name or '').upper()
+    etf_tokens = ['TIGER', 'KODEX', 'ACE', 'SOL', 'RISE', 'KBSTAR', 'HANARO', 'KOSEF', 'ARIRANG', 'TIMEFOLIO', 'PLUS', 'KIWOOM', 'FOCUS', 'WON', 'ETF']
+    return any(t in n for t in etf_tokens) or '리츠' in str(name) or '맥쿼리' in str(name)
+
+
+def _naver_real_per(code):
+    """네이버 금융의 현재 PER/업종PER을 보조적으로 가져온다."""
+    try:
+        url = f'https://finance.naver.com/item/main.naver?code={code}'
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+        res.encoding = 'euc-kr'
+        text = BeautifulSoup(res.text, 'html.parser').get_text(' ', strip=True)
+        m = re.search(r'PER\s*[:]?\s*([0-9]+(?:\.[0-9]+)?)', text, re.I)
+        per = _safe_positive_number(m.group(1)) if m else None
+        im = re.search(r'업종PER\s*[:]?\s*([0-9]+(?:\.[0-9]+)?)', text, re.I)
+        industry = _safe_positive_number(im.group(1)) if im else None
+        return per, industry
+    except Exception:
+        return None, None
+
+
+def _get_real_valuation(code):
+    """PER 우선순위: trailingPE -> forwardPE -> Naver PER -> 업종PER -> 15 최후보험."""
+    for suffix in ['.KS', '.KQ']:
+        try:
+            t = yf.Ticker(f'{code}{suffix}')
+            info = t.info or {}
+            trailing = _safe_positive_number(info.get('trailingPE'))
+            forward = _safe_positive_number(info.get('forwardPE'))
+            if trailing and trailing < 5000:
+                return {'per': trailing, 'source': 'Yahoo Finance · trailingPE', 'type': '실제 PER', 'industry_per': _safe_positive_number(info.get('industryPE'))}
+            if forward and forward < 5000:
+                return {'per': forward, 'source': 'Yahoo Finance · forwardPE', 'type': '추정 PER', 'industry_per': _safe_positive_number(info.get('industryPE'))}
+        except Exception as e:
+            logging.warning('PER 조회 실패 %s: %s', code, e)
+    naver_per, industry_per = _naver_real_per(code)
+    if naver_per:
+        return {'per': naver_per, 'source': 'Naver Finance · PER', 'type': '실제 PER', 'industry_per': industry_per}
+    if industry_per:
+        return {'per': industry_per, 'source': 'Naver Finance · 업종PER', 'type': '업종 평균 PER', 'industry_per': industry_per}
+    return {'per': 15.0, 'source': 'Fallback · 데이터 없음', 'type': '보험값', 'industry_per': None}
+
+
+def _growth_pct(curr, prev):
+    curr, prev = _safe_number(curr), _safe_number(prev)
+    if curr is None or prev is None or prev == 0:
+        return None
+    return (curr - prev) / abs(prev) * 100.0
+
+
+def _growth_quality(q_dict, sorted_q, annual_dict=None):
+    """매출 30% + 영업이익 50% + OPM 추세 20%의 지속가능 성장률."""
+    profit_yoys, revenue_yoys = [], []
+    for i in range(4, len(sorted_q)):
+        cur = q_dict[sorted_q[i]]
+        prev = q_dict[sorted_q[i-4]]
+        pg = _growth_pct(cur.get('profit'), prev.get('profit'))
+        rg = _growth_pct(cur.get('revenue'), prev.get('revenue'))
+        if pg is not None and np.isfinite(pg): profit_yoys.append(float(pg))
+        if rg is not None and np.isfinite(rg): revenue_yoys.append(float(rg))
+
+    # 분기 YoY가 1개도 없으면 연간 실적 성장률을 보조 사용한다.
+    if annual_dict:
+        years = sorted(annual_dict.keys())
+        for i in range(1, len(years)):
+            pg = _growth_pct(annual_dict[years[i]].get('profit'), annual_dict[years[i-1]].get('profit'))
+            rg = _growth_pct(annual_dict[years[i]].get('revenue'), annual_dict[years[i-1]].get('revenue'))
+            if pg is not None and np.isfinite(pg): profit_yoys.append(float(pg))
+            if rg is not None and np.isfinite(rg): revenue_yoys.append(float(rg))
+
+    profit_growth = float(np.mean(profit_yoys[-4:])) if profit_yoys else None
+    revenue_growth = float(np.mean(revenue_yoys[-4:])) if revenue_yoys else None
+
+    opms = []
+    for k in sorted_q:
+        r = q_dict[k].get('revenue', 0)
+        p = q_dict[k].get('profit', 0)
+        if r:
+            opms.append(float(p) / float(r) * 100.0)
+    opm_trend = None
+    if len(opms) >= 4:
+        recent = float(np.mean(opms[-2:]))
+        older = float(np.mean(opms[-4:-2]))
+        opm_trend = recent - older
+    elif len(opms) >= 2:
+        opm_trend = opms[-1] - opms[0]
+
+    if profit_growth is None and revenue_growth is None:
+        quality = None
+    else:
+        pg = profit_growth if profit_growth is not None else revenue_growth
+        rg = revenue_growth if revenue_growth is not None else profit_growth
+        trend = opm_trend if opm_trend is not None else 0.0
+        if trend >= 3: opm_factor = 1.15
+        elif trend >= 0: opm_factor = 1.07
+        elif trend > -3: opm_factor = 0.98
+        else: opm_factor = 0.85
+        quality = (rg * 0.30 + pg * 0.50) * opm_factor + trend * 0.20
+        quality = float(np.clip(quality, -100.0, 100.0))
+
+    return {
+        'profit_growth': profit_growth,
+        'revenue_growth': revenue_growth,
+        'opm_trend': opm_trend,
+        'growth_quality': quality,
+        'profit_samples': len(profit_yoys),
+        'revenue_samples': len(revenue_yoys),
     }
 
+
+def get_pure_real_fundamentals(code, name, df_price_full):
+    is_etf = _classify_security(name)
+    cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 0.0
+    valuation = _get_real_valuation(code) if not is_etf else {'per': None, 'source': 'ETF · PER 적용 제외', 'type': 'ETF', 'industry_per': None}
+    fin_payload = {
+        'is_etf': is_etf,
+        'quarterly': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
+        'semiannual': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
+        'annual': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
+        'growth_model': {
+            'est_per': valuation['per'], 'per_source': valuation['source'], 'per_type': valuation['type'],
+            'industry_per': valuation.get('industry_per'), 'growth_rate': None, 'peg': None,
+            'target_peg_05': None, 'target_peg_10': None,
+            'growth_quality': None, 'profit_growth': None, 'revenue_growth': None, 'opm_trend': None,
+            'data_status': 'ETF · 기업 PER/PEG 평가 제외' if is_etf else '재무데이터 수집 중'
+        }
+    }
     if is_etf:
         return fin_payload
 
     def get_closest_price(date_str):
         try:
-            clean_d = re.sub(r'[^\d.]', '', date_str).strip()
-            parts = clean_d.split('.')
-            target_dt = pd.to_datetime(f"{parts[0]}-{int(parts[1]):02d}-28") if len(parts) == 2 else pd.to_datetime(clean_d)
+            parts = re.sub(r'[^\d.]', '', str(date_str)).split('.')
+            target_dt = pd.to_datetime(f'{parts[0]}-{int(parts[1]):02d}-28') if len(parts) == 2 else pd.to_datetime(date_str)
             sub = df_price_full[df_price_full.index <= target_dt]
-            if not sub.empty:
-                return int(sub['Close'].iloc[-1])
-            return int(df_price_full['Close'].iloc[-1])
+            return int(sub['Close'].iloc[-1]) if not sub.empty else int(df_price_full['Close'].iloc[-1])
         except Exception:
             return int(df_price_full['Close'].iloc[-1])
 
-    q_dict = {}
-    try:
-        for suffix in ['.KS', '.KQ']:
-            t = yf.Ticker(f"{code}{suffix}")
+    q_dict, annual_dict = {}, {}
+    for suffix in ['.KS', '.KQ']:
+        try:
+            t = yf.Ticker(f'{code}{suffix}')
             q_inc = t.quarterly_income_stmt
             if q_inc is not None and not q_inc.empty:
                 for col in q_inc.columns:
@@ -452,95 +581,81 @@ def get_pure_real_fundamentals(code, name, df_price_full):
                     prof = float(q_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in q_inc.index and pd.notna(q_inc.loc['Operating Income', col]) else 0.0
                     net_m = [idx for idx in q_inc.index if 'Net Income' in str(idx)]
                     net = float(q_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(q_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0:
-                        q_dict[lbl] = {"revenue": round(rev, 0), "profit": round(prof, 0), "net": round(net, 0)}
-            if q_dict:
-                break
-    except Exception:
-        pass
+                    if rev > 0 or prof != 0: q_dict[lbl] = {'revenue': rev, 'profit': prof, 'net': net}
+            a_inc = t.income_stmt
+            if a_inc is not None and not a_inc.empty:
+                for col in a_inc.columns:
+                    lbl = pd.to_datetime(col).strftime('%Y')
+                    rev = float(a_inc.loc['Total Revenue', col] / 1e8) if 'Total Revenue' in a_inc.index and pd.notna(a_inc.loc['Total Revenue', col]) else 0.0
+                    prof = float(a_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in a_inc.index and pd.notna(a_inc.loc['Operating Income', col]) else 0.0
+                    net_m = [idx for idx in a_inc.index if 'Net Income' in str(idx)]
+                    net = float(a_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(a_inc.loc[net_m[0], col]) else 0.0
+                    if rev > 0 or prof != 0: annual_dict[lbl] = {'revenue': rev, 'profit': prof, 'net': net}
+            if q_dict: break
+        except Exception as e:
+            logging.warning('재무 데이터 조회 실패 %s: %s', code, e)
 
     if not q_dict:
         try:
-            url = f"https://finance.naver.com/item/main.naver?code={code}"
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            url = f'https://finance.naver.com/item/main.naver?code={code}'
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
             tables = pd.read_html(StringIO(res.text), encoding='euc-kr')
             for table in tables:
                 if isinstance(table.columns, pd.MultiIndex):
                     t_idx = table.set_index(table.columns[0])
                     q_cols = [c for c in table.columns if '분기' in str(c[0])]
                     if q_cols:
-                        n_lbls = [str(c[1]).strip() for c in q_cols]
+                        n_lbls = [str(c[1]).replace('(E)', '').strip() for c in q_cols]
                         def parse_n(kw):
                             m = [i for i in t_idx.index if kw in str(i)]
-                            if m:
-                                row = t_idx.loc[m[0]][q_cols]
-                                return [float(re.sub(r'[^\d.-]', '', str(v))) if pd.notna(v) and re.sub(r'[^\d.-]', '', str(v)) not in ['', '-', '.'] else 0.0 for v in row]
-                            return [0.0] * len(q_cols)
-                        n_rev, n_prof, n_net = parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')
-                        for l, r, p, n in zip(n_lbls, n_rev, n_prof, n_net):
-                            clean_l = l.replace('(E)', '').strip()
-                            if r > 0 or p != 0:
-                                q_dict[clean_l] = {"revenue": r, "profit": p, "net": n}
-                    break
-        except Exception:
-            pass
+                            if not m: return [0.0] * len(q_cols)
+                            vals = t_idx.loc[m[0]][q_cols]
+                            out=[]
+                            for v in vals:
+                                raw=re.sub(r'[^\d.-]', '', str(v))
+                                out.append(float(raw) if raw not in ['', '-', '.'] else 0.0)
+                            return out
+                        for l, r, p, n in zip(n_lbls, parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')):
+                            if r > 0 or p != 0: q_dict[l] = {'revenue': r, 'profit': p, 'net': n}
+                        break
+        except Exception as e:
+            logging.warning('Naver 재무데이터 실패 %s: %s', code, e)
 
     if not q_dict:
+        fin_payload['growth_model']['data_status'] = '재무데이터 부족 · PEG 미계산'
         return fin_payload
 
     sorted_q = sorted(q_dict.keys())
     q_labels, q_rev, q_prof, q_net, q_opm, q_prices, q_growth_yoy = [], [], [], [], [], [], []
     for idx, k in enumerate(sorted_q):
-        r, p, n = q_dict[k]["revenue"], q_dict[k]["profit"], q_dict[k]["net"]
-        q_labels.append(k)
-        q_rev.append(r)
-        q_prof.append(p)
-        q_net.append(n)
-        q_opm.append(round((p / r * 100), 1) if r > 0 else 0.0)
-        q_prices.append(get_closest_price(k))
-        if idx >= 4:
-            prev_p = q_dict[sorted_q[idx-4]]["profit"]
-            yoy = round(((p - prev_p) / abs(prev_p) * 100), 1) if prev_p != 0 else 0.0
-        else:
-            yoy = 10.0
-        q_growth_yoy.append(yoy)
+        r, p, n = q_dict[k]['revenue'], q_dict[k]['profit'], q_dict[k]['net']
+        q_labels.append(k); q_rev.append(round(r, 0)); q_prof.append(round(p, 0)); q_net.append(round(n, 0))
+        q_opm.append(round(p / r * 100, 1) if r > 0 else 0.0); q_prices.append(get_closest_price(k))
+        q_growth_yoy.append(round(_growth_pct(p, q_dict[sorted_q[idx-4]]['profit']), 1) if idx >= 4 and q_dict[sorted_q[idx-4]]['profit'] != 0 else None)
 
-    fin_payload["quarterly"] = {
-        "labels": q_labels,
-        "profit": q_prof,
-        "revenue": q_rev,
-        "net": q_net,
-        "opm": q_opm,
-        "prices": q_prices,
-        "growth_yoy": q_growth_yoy
-    }
-    fin_payload["semiannual"] = {
-        "labels": q_labels[::2],
-        "profit": q_prof[::2],
-        "revenue": q_rev[::2],
-        "net": q_net[::2],
-        "opm": q_opm[::2],
-        "prices": q_prices[::2],
-        "growth_yoy": q_growth_yoy[::2]
-    }
-    fin_payload["annual"] = {
-        "labels": [l[:4] + "년" for l in q_labels[::4]],
-        "profit": q_prof[::4],
-        "revenue": q_rev[::4],
-        "net": q_net[::4],
-        "opm": q_opm[::4],
-        "prices": q_prices[::4],
-        "growth_yoy": q_growth_yoy[::4]
-    }
+    fin_payload['quarterly'] = {'labels': q_labels, 'profit': q_prof, 'revenue': q_rev, 'net': q_net, 'opm': q_opm, 'prices': q_prices, 'growth_yoy': q_growth_yoy}
+    fin_payload['semiannual'] = {k: v[::2] for k, v in fin_payload['quarterly'].items()}
+    fin_payload['annual'] = {'labels': [l[:4] + '년' for l in q_labels[::4]], 'profit': q_prof[::4], 'revenue': q_rev[::4], 'net': q_net[::4], 'opm': q_opm[::4], 'prices': q_prices[::4], 'growth_yoy': q_growth_yoy[::4]}
 
-    recent_yoy = q_growth_yoy[-1] if q_growth_yoy else 10.0
-    fin_payload["growth_model"] = {
-        "est_per": 15.0,
-        "growth_rate": recent_yoy,
-        "peg": 1.0,
-        "target_peg_05": int(cur_price * 0.8),
-        "target_peg_10": int(cur_price * 1.05)
-    }
+    gq = _growth_quality(q_dict, sorted_q, annual_dict)
+    growth_rate = gq['growth_quality']
+    per = valuation['per']
+    peg = (per / growth_rate) if per and growth_rate and growth_rate > 0 else None
+    if per and growth_rate and growth_rate > 0:
+        fair_per = growth_rate
+        bottom_per = growth_rate * 0.5
+        target_10 = int(cur_price * fair_per / per)
+        target_05 = int(cur_price * bottom_per / per)
+    else:
+        target_10 = None; target_05 = None
+
+    fin_payload['growth_model'].update({
+        'est_per': per, 'growth_rate': growth_rate, 'peg': peg,
+        'target_peg_05': target_05, 'target_peg_10': target_10,
+        'growth_quality': growth_rate, 'profit_growth': gq['profit_growth'],
+        'revenue_growth': gq['revenue_growth'], 'opm_trend': gq['opm_trend'],
+        'data_status': '실제 PER + 지속가능 성장률 계산 완료' if per and growth_rate is not None else '일부 데이터 부족'
+    })
     return fin_payload
 
 
@@ -637,11 +752,18 @@ def calculate_multi_period_engine(code, name):
     div_1y = matrix_table[0]['floor_price']
     div_3y = matrix_table[1]['floor_price']
     div_5y = matrix_table[2]['floor_price']
-    peg_fair = gm['target_peg_10']
-    peg_bottom = gm['target_peg_05']
-    growth_rate = gm['growth_rate']
+    growth_rate = gm.get('growth_rate')
+    peg_fair = gm.get('target_peg_10')
+    peg_bottom = gm.get('target_peg_05')
 
-    w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
+    # 성장 데이터가 없거나 ETF인 경우 PEG 비중을 자동으로 0으로 돌리고 배당 밴드만 사용
+    if growth_rate is None or peg_fair is None or peg_bottom is None:
+        w_div, w_growth = 1.0, 0.0
+        profile_desc = '재무데이터 부족 · 배당가치 단독형'
+        peg_fair = latest_price
+        peg_bottom = latest_price
+    else:
+        w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
 
     buy_step_1 = int(div_1y * w_div + peg_fair * w_growth)
     buy_step_2 = int(div_3y * w_div + (peg_fair * 0.6 + peg_bottom * 0.4) * w_growth)
@@ -705,6 +827,20 @@ def generate_v39_dashboard(query, code=None, name=None):
     w_div = data['w_div']
     w_growth = data['w_growth']
     profile_desc = data['profile_desc']
+    per_value = gm.get('est_per')
+    per_text = f"{per_value:.2f}배" if isinstance(per_value, (int, float)) else 'N/A'
+    growth_value = gm.get('growth_quality')
+    growth_text = f"{growth_value:+.1f}%" if isinstance(growth_value, (int, float)) else 'N/A'
+    profit_growth = gm.get('profit_growth')
+    profit_text = f"{profit_growth:+.1f}%" if isinstance(profit_growth, (int, float)) else 'N/A'
+    revenue_growth = gm.get('revenue_growth')
+    revenue_text = f"{revenue_growth:+.1f}%" if isinstance(revenue_growth, (int, float)) else 'N/A'
+    opm_trend = gm.get('opm_trend')
+    opm_text = f"{opm_trend:+.1f}%p" if isinstance(opm_trend, (int, float)) else 'N/A'
+    peg_value = gm.get('peg')
+    peg_text = f"{peg_value:.2f}" if isinstance(peg_value, (int, float)) else 'N/A'
+    per_source = gm.get('per_source', '데이터 없음')
+    data_status = gm.get('data_status', '')
 
     # IMPORTANT: 중첩 f-string + JavaScript 중괄호로 인한 SyntaxError 방지
     matrix_rows = "".join(
@@ -812,6 +948,25 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <h3 class="text-lg font-black text-white mt-0.5">{b3:,}원</h3>
                     <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 대바닥 + PEG 바닥가 ({w_div}:{w_growth})</p>
                 </div>
+            </div>
+        </div>
+
+        <!-- [v39.5] 실제 PER + 지속가능 성장률 + PEG 품질 카드 -->
+        <div class="bg-slate-900/90 p-4 rounded-2xl border border-emerald-500/30 shadow-xl space-y-3">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-2">
+                <div>
+                    <h2 class="text-sm md:text-base font-black text-emerald-300">🧮 v39.5 실적 기반 밸류에이션</h2>
+                    <p class="text-[10px] text-slate-500 mt-1">고정 PER 15배/고정 성장률 제거 · 실제 데이터 우선</p>
+                </div>
+                <span class="text-[10px] text-slate-500">{data_status}</span>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">PER</p><b class="text-lg text-white">{per_text}</b><p class="text-[9px] text-slate-500 mt-1">{per_source}</p></div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">Growth Quality</p><b class="text-lg text-emerald-400">{growth_text}</b><p class="text-[9px] text-slate-500 mt-1">매출30 · 영업익50 · OPM20</p></div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">영업익 성장</p><b class="text-lg text-emerald-300">{profit_text}</b></div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">매출 성장</p><b class="text-lg text-cyan-300">{revenue_text}</b></div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">OPM 추세</p><b class="text-lg text-amber-300">{opm_text}</b></div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">PEG</p><b class="text-lg text-indigo-300">{peg_text}</b></div>
             </div>
         </div>
 

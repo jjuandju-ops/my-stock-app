@@ -1,5 +1,5 @@
 # ============================================================
-# [v39.4] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
+# [v39.6] 종목별 맞춤형 동적 가중치(Dynamic Weighting) 모델 탑재 최종 대시보드
 #         - 네이버 자동완성 API를 활용한 종목 검색 리스트
 #         - 다중 가격 데이터 소스 폴백 (FinanceDataReader → yfinance → Naver)
 # ============================================================
@@ -26,97 +26,116 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # 특히 "부동산"처럼 종목명 중간에 포함된 문자열도 모두 찾는다.
 krx_df = pd.DataFrame()
 
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def load_krx_listing():
-    """국내 주식/ETF 종목명 검색용 전체 목록. FDR 단일 장애를 피하기 위해 Naver API를 폴백으로 사용."""
+    """KRX 전체 종목 목록. FDR 실패 시 네이버 시장별 페이지를 직접 수집."""
     frames = []
 
-    def normalize(df):
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["Code", "Name"])
-        code_col = next((c for c in ["Code", "Symbol", "symbolCode", "itemcode"] if c in df.columns), None)
-        name_col = next((c for c in ["Name", "name", "stockName", "stockNameKor", "stockNameEng", "itemname"] if c in df.columns), None)
-        if code_col is None or name_col is None:
-            return pd.DataFrame(columns=["Code", "Name"])
-        out = df[[code_col, name_col]].copy()
-        out.columns = ["Code", "Name"]
-        out["Code"] = out["Code"].astype(str).str.extract(r"(\d{6})", expand=False)
-        out["Name"] = out["Name"].astype(str).str.replace(r"<[^>]+>", "", regex=True).str.replace("\xa0", " ", regex=False).str.strip()
-        out = out.dropna(subset=["Code", "Name"])
-        out = out[(out["Code"].str.len() == 6) & (out["Name"] != "") & (out["Name"].str.lower() != "nan")]
-        return out.drop_duplicates("Code")
-
-    # FDR: KRX가 정상인 환경에서는 가장 빠른 경로
-    for market in ["KRX", "KRX-DESC", "KOSPI", "KOSDAQ", "KONEX"]:
+    # 1) FinanceDataReader
+    for market in ['KRX', 'KOSPI', 'KOSDAQ', 'KONEX', 'KRX-DESC']:
         try:
-            n = normalize(fdr.StockListing(market))
-            if not n.empty:
-                frames.append(n)
+            df = fdr.StockListing(market)
+            if df is not None and not df.empty and 'Code' in df.columns and 'Name' in df.columns:
+                out = df[['Code', 'Name']].copy()
+                out.columns = ['Code', 'Name']
+                out['Code'] = out['Code'].astype(str).str.extract(r'(\d{6})', expand=False)
+                out['Name'] = (
+                    out['Name'].astype(str)
+                    .str.replace(r'<[^>]+>', '', regex=True)
+                    .str.strip()
+                )
+                out = out.dropna(subset=['Code', 'Name'])
+                out = out[(out['Code'].str.len() == 6) & (out['Name'] != '')]
+                frames.append(out)
         except Exception as e:
-            logging.warning("FDR %s 실패: %s", market, e)
+            logging.warning(f"FDR {market} 목록 실패: {e}")
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36",
-        "Referer": "https://finance.naver.com/",
-        "Accept": "application/json,text/plain,*/*",
-    }
-
-    def naver_exchange(exchange):
-        rows = []
-        size = 100
-        try:
-            first = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page=1&pageSize={size}", headers=headers, timeout=10)
-            first.raise_for_status()
-            obj = first.json()
-            total = int(obj.get("totalCount", 0) or 0)
-            pages = min(max(1, (total + size - 1) // size), 100)
-            all_pages = [obj]
-            for page in range(2, pages + 1):
-                try:
-                    rr = requests.get(f"https://api.stock.naver.com/stock/exchange/{exchange}/marketValue?page={page}&pageSize={size}", headers=headers, timeout=10)
-                    rr.raise_for_status()
-                    all_pages.append(rr.json())
-                except Exception as e:
-                    logging.warning("Naver %s page %d 실패: %s", exchange, page, e)
+    # 2) Naver market sum fallback
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    for sosok in [0, 1, 2]:
+        # 0 KOSPI, 1 KOSDAQ, 2 KONEX
+        for page in range(1, 40):
+            try:
+                url = (
+                    "https://finance.naver.com/sise/sise_market_sum.naver"
+                    f"?sosok={sosok}&page={page}"
+                )
+                res = requests.get(url, headers=headers, timeout=7)
+                res.encoding = 'cp949'
+                tables = pd.read_html(StringIO(res.text), encoding='cp949')
+                if not tables:
                     break
-            for page_obj in all_pages:
-                for item in page_obj.get("stocks", []) or []:
-                    code = str(item.get("symbolCode", "")).strip()
-                    name = (item.get("stockName") or item.get("stockNameKor") or item.get("stockNameEng") or item.get("name") or "")
-                    name = re.sub(r"<[^>]+>", "", str(name)).strip()
-                    if re.fullmatch(r"\d{6}", code) and name:
-                        rows.append({"Code": code, "Name": name})
-        except Exception as e:
-            logging.warning("Naver %s 목록 실패: %s", exchange, e)
-        return normalize(pd.DataFrame(rows))
 
-    for exchange in ["KOSPI", "KOSDAQ", "KONEX"]:
-        n = naver_exchange(exchange)
-        if not n.empty:
-            frames.append(n)
+                table = None
+                for t in tables:
+                    cols = [str(c) for c in t.columns]
+                    if '종목명' in cols:
+                        table = t
+                        break
+                if table is None:
+                    break
 
-    # ETF도 종목명 검색 대상에 포함
+                name_col = '종목명'
+                code_col = '종목코드' if '종목코드' in table.columns else None
+                if code_col is None:
+                    # 링크의 item/main.naver?code=XXXXXX에서 코드 추출
+                    soup = BeautifulSoup(res.text, 'html.parser')
+                    rows = []
+                    for a in soup.select('a.tltle'):
+                        name = a.get_text(strip=True)
+                        href = a.get('href', '')
+                        mm = re.search(r'code=(\d{6})', href)
+                        if mm and name:
+                            rows.append({'Code': mm.group(1), 'Name': name})
+                    if rows:
+                        frames.append(pd.DataFrame(rows))
+                else:
+                    tmp = table[[code_col, name_col]].copy()
+                    tmp.columns = ['Code', 'Name']
+                    tmp['Code'] = tmp['Code'].astype(str).str.extract(r'(\d{6})', expand=False)
+                    tmp['Name'] = tmp['Name'].astype(str).str.strip()
+                    frames.append(tmp)
+
+                # 페이지가 비어 있으면 종료
+                if len(table) == 0:
+                    break
+            except Exception as e:
+                logging.warning(f"Naver 시장목록 실패 sosok={sosok}, page={page}: {e}")
+                break
+
+    # 3) Naver ETF 목록 API
     try:
-        r = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn", headers=headers, timeout=10)
-        r.raise_for_status()
-        etfs = r.json().get("result", {}).get("etfItemList", []) or []
-        rows = [{"Code": str(x.get("itemcode", "")).strip(), "Name": str(x.get("itemname", "")).strip()} for x in etfs]
-        n = normalize(pd.DataFrame(rows))
-        if not n.empty:
-            frames.append(n)
+        etf_url = "https://finance.naver.com/api/sise/etfItemList.nhn"
+        res = requests.get(etf_url, headers=headers, timeout=7)
+        data = res.json()
+        items = data.get("result", {}).get("etfItemList", [])
+        if items:
+            frames.append(pd.DataFrame([
+                {"Code": str(x.get("itemcode", "")), "Name": str(x.get("itemname", ""))}
+                for x in items
+                if x.get("itemcode") and x.get("itemname")
+            ]))
     except Exception as e:
-        logging.warning("Naver ETF 목록 실패: %s", e)
+        logging.warning(f"Naver ETF 목록 실패: {e}")
+
 
     if not frames:
-        logging.error("국내 종목 목록을 확보하지 못했습니다.")
-        return pd.DataFrame(columns=["Code", "Name"])
+        return pd.DataFrame(columns=['Code', 'Name'])
 
-    out = pd.concat(frames, ignore_index=True)
-    out["Code"] = out["Code"].astype(str).str.zfill(6)
-    out["Name"] = out["Name"].astype(str).str.strip()
-    out = out.drop_duplicates("Code").reset_index(drop=True)
-    logging.info("국내 검색 DB 확보: %d개", len(out))
-    return out
+    result = pd.concat(frames, ignore_index=True)
+    result = result.dropna(subset=['Code', 'Name'])
+    result['Code'] = result['Code'].astype(str).str.extract(r'(\d{6})', expand=False)
+    result['Name'] = (
+        result['Name'].astype(str)
+        .str.replace(r'<[^>]+>', '', regex=True)
+        .str.strip()
+    )
+    result = result[
+        result['Code'].str.fullmatch(r'\d{6}', na=False)
+        & (result['Name'] != '')
+    ]
+    return result.drop_duplicates('Code').reset_index(drop=True)
 
 
 def search_naver_autocomplete(query):
@@ -350,9 +369,8 @@ def get_dps_automatically(code, name):
     except Exception:
         pass
 
-    if '리츠' in name or '맥쿼리' in name:
-        return 730.0
-    return 350.0
+    # 배당 데이터가 없으면 임의의 DPS를 넣지 않는다.
+    return np.nan
 
 
 # ---------- 뉴스 및 공시 ----------
@@ -412,255 +430,939 @@ def get_news_and_disclosures(code):
     return news_list, notice_list
 
 
-# ---------- 실제 재무 데이터 수집 ----------
-def _safe_positive_number(value):
+
+# ---------- v39.6 재무/PEG 엔진 ----------
+def _safe_float(v, default=np.nan):
     try:
-        v = float(value)
-        return v if np.isfinite(v) and v > 0 else None
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return default
+        x = float(v)
+        return x if np.isfinite(x) else default
     except Exception:
-        return None
+        return default
 
 
-def _safe_number(value):
-    try:
-        v = float(value)
-        return v if np.isfinite(v) else None
-    except Exception:
-        return None
-
-
-def _classify_security(name):
-    n = str(name or '').upper()
-    etf_tokens = ['TIGER', 'KODEX', 'ACE', 'SOL', 'RISE', 'KBSTAR', 'HANARO', 'KOSEF', 'ARIRANG', 'TIMEFOLIO', 'PLUS', 'KIWOOM', 'FOCUS', 'WON', 'ETF']
-    return any(t in n for t in etf_tokens) or '리츠' in str(name) or '맥쿼리' in str(name)
-
-
-def _naver_real_per(code):
-    """네이버 금융의 현재 PER/업종PER을 보조적으로 가져온다."""
-    try:
-        url = f'https://finance.naver.com/item/main.naver?code={code}'
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
-        res.encoding = 'euc-kr'
-        text = BeautifulSoup(res.text, 'html.parser').get_text(' ', strip=True)
-        m = re.search(r'PER\s*[:]?\s*([0-9]+(?:\.[0-9]+)?)', text, re.I)
-        per = _safe_positive_number(m.group(1)) if m else None
-        im = re.search(r'업종PER\s*[:]?\s*([0-9]+(?:\.[0-9]+)?)', text, re.I)
-        industry = _safe_positive_number(im.group(1)) if im else None
-        return per, industry
-    except Exception:
-        return None, None
-
-
-def _get_real_valuation(code):
-    """PER 우선순위: trailingPE -> forwardPE -> Naver PER -> 업종PER -> 15 최후보험."""
+def _fetch_yf_info(code):
+    """Yahoo Finance PER/메타데이터. 실패하면 {}."""
     for suffix in ['.KS', '.KQ']:
         try:
-            t = yf.Ticker(f'{code}{suffix}')
+            t = yf.Ticker(f"{code}{suffix}")
             info = t.info or {}
-            trailing = _safe_positive_number(info.get('trailingPE'))
-            forward = _safe_positive_number(info.get('forwardPE'))
-            if trailing and trailing < 5000:
-                return {'per': trailing, 'source': 'Yahoo Finance · trailingPE', 'type': '실제 PER', 'industry_per': _safe_positive_number(info.get('industryPE'))}
-            if forward and forward < 5000:
-                return {'per': forward, 'source': 'Yahoo Finance · forwardPE', 'type': '추정 PER', 'industry_per': _safe_positive_number(info.get('industryPE'))}
+            if info:
+                return info, f"Yahoo Finance ({suffix})"
         except Exception as e:
-            logging.warning('PER 조회 실패 %s: %s', code, e)
-    naver_per, industry_per = _naver_real_per(code)
-    if naver_per:
-        return {'per': naver_per, 'source': 'Naver Finance · PER', 'type': '실제 PER', 'industry_per': industry_per}
-    if industry_per:
-        return {'per': industry_per, 'source': 'Naver Finance · 업종PER', 'type': '업종 평균 PER', 'industry_per': industry_per}
-    return {'per': 15.0, 'source': 'Fallback · 데이터 없음', 'type': '보험값', 'industry_per': None}
+            logging.warning(f"Yahoo info 실패 {code}{suffix}: {e}")
+    return {}, "미확인"
 
 
-def _growth_pct(curr, prev):
-    curr, prev = _safe_number(curr), _safe_number(prev)
-    if curr is None or prev is None or prev == 0:
-        return None
-    return (curr - prev) / abs(prev) * 100.0
+def _fetch_naver_per(code):
+    """네이버 금융에서 PER/업종 PER을 최대한 방어적으로 추출."""
+    result = {"trailing_pe": np.nan, "forward_pe": np.nan, "sector_pe": np.nan, "source": ""}
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        res = requests.get(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=7
+        )
+        res.encoding = 'cp949'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        text = soup.get_text(" ", strip=True)
+
+        # 종목 기본정보 영역의 PER
+        patterns = [
+            r'PER\s*\(배\)\s*([0-9]+(?:\.[0-9]+)?)',
+            r'PER\s*([0-9]+(?:\.[0-9]+)?)\s*배',
+            r'PER\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)'
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                v = _safe_float(m.group(1))
+                if np.isfinite(v) and 0 < v < 1000:
+                    result["trailing_pe"] = v
+                    result["source"] = "Naver Finance"
+                    break
+
+        # HTML table에서도 PER 행 탐색
+        if not np.isfinite(result["trailing_pe"]):
+            for tr in soup.select("tr"):
+                row_text = tr.get_text(" ", strip=True)
+                if "PER" in row_text.upper():
+                    nums = re.findall(r'(?<!\d)(\d+(?:\.\d+)?)(?!\d)', row_text)
+                    for num in nums:
+                        v = _safe_float(num)
+                        if np.isfinite(v) and 0 < v < 1000:
+                            result["trailing_pe"] = v
+                            result["source"] = "Naver Finance"
+                            break
+                    if np.isfinite(result["trailing_pe"]):
+                        break
+
+        # 업종 PER 링크/텍스트
+        sector_patterns = [
+            r'업종PER\s*([0-9]+(?:\.[0-9]+)?)',
+            r'업종\s*PER\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'동일업종\s*PER\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)'
+        ]
+        for pat in sector_patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                v = _safe_float(m.group(1))
+                if np.isfinite(v) and 0 < v < 1000:
+                    result["sector_pe"] = v
+                    break
+    except Exception as e:
+        logging.warning(f"Naver PER 실패 {code}: {e}")
+
+    return result
 
 
-def _growth_quality(q_dict, sorted_q, annual_dict=None):
-    """매출 30% + 영업이익 50% + OPM 추세 20%의 지속가능 성장률."""
-    profit_yoys, revenue_yoys = [], []
-    for i in range(4, len(sorted_q)):
-        cur = q_dict[sorted_q[i]]
-        prev = q_dict[sorted_q[i-4]]
-        pg = _growth_pct(cur.get('profit'), prev.get('profit'))
-        rg = _growth_pct(cur.get('revenue'), prev.get('revenue'))
-        if pg is not None and np.isfinite(pg): profit_yoys.append(float(pg))
-        if rg is not None and np.isfinite(rg): revenue_yoys.append(float(rg))
+def _resolve_per(code, name):
+    """
+    PER 우선순위:
+    1) Yahoo trailingPE
+    2) Yahoo forwardPE
+    3) Naver PER
+    4) Naver 업종 PER
+    5) 데이터 없음 → NULL
+    """
+    info, yf_source = _fetch_yf_info(code)
+    naver = _fetch_naver_per(code)
 
-    # 분기 YoY가 1개도 없으면 연간 실적 성장률을 보조 사용한다.
-    if annual_dict:
-        years = sorted(annual_dict.keys())
-        for i in range(1, len(years)):
-            pg = _growth_pct(annual_dict[years[i]].get('profit'), annual_dict[years[i-1]].get('profit'))
-            rg = _growth_pct(annual_dict[years[i]].get('revenue'), annual_dict[years[i-1]].get('revenue'))
-            if pg is not None and np.isfinite(pg): profit_yoys.append(float(pg))
-            if rg is not None and np.isfinite(rg): revenue_yoys.append(float(rg))
+    trailing = _safe_float(info.get("trailingPE"))
+    forward = _safe_float(info.get("forwardPE"))
+    sector = _safe_float(naver.get("sector_pe"))
 
-    profit_growth = float(np.mean(profit_yoys[-4:])) if profit_yoys else None
-    revenue_growth = float(np.mean(revenue_yoys[-4:])) if revenue_yoys else None
+    if np.isfinite(trailing) and 0 < trailing < 500:
+        return {
+            "per": trailing,
+            "source": "Yahoo trailingPE",
+            "raw_source": yf_source,
+            "is_fallback": False
+        }
 
-    opms = []
-    for k in sorted_q:
-        r = q_dict[k].get('revenue', 0)
-        p = q_dict[k].get('profit', 0)
-        if r:
-            opms.append(float(p) / float(r) * 100.0)
-    opm_trend = None
-    if len(opms) >= 4:
-        recent = float(np.mean(opms[-2:]))
-        older = float(np.mean(opms[-4:-2]))
-        opm_trend = recent - older
-    elif len(opms) >= 2:
-        opm_trend = opms[-1] - opms[0]
+    if np.isfinite(forward) and 0 < forward < 500:
+        return {
+            "per": forward,
+            "source": "Yahoo forwardPE",
+            "raw_source": yf_source,
+            "is_fallback": False
+        }
 
-    if profit_growth is None and revenue_growth is None:
-        quality = None
-    else:
-        pg = profit_growth if profit_growth is not None else revenue_growth
-        rg = revenue_growth if revenue_growth is not None else profit_growth
-        trend = opm_trend if opm_trend is not None else 0.0
-        if trend >= 3: opm_factor = 1.15
-        elif trend >= 0: opm_factor = 1.07
-        elif trend > -3: opm_factor = 0.98
-        else: opm_factor = 0.85
-        quality = (rg * 0.30 + pg * 0.50) * opm_factor + trend * 0.20
-        quality = float(np.clip(quality, -100.0, 100.0))
+    nper = _safe_float(naver.get("trailing_pe"))
+    if np.isfinite(nper) and 0 < nper < 500:
+        return {
+            "per": nper,
+            "source": "Naver Finance PER",
+            "raw_source": "Naver Finance",
+            "is_fallback": False
+        }
 
+    if np.isfinite(sector) and 0 < sector < 500:
+        return {
+            "per": sector,
+            "source": "Naver 업종 PER",
+            "raw_source": "Naver Finance",
+            "is_fallback": False
+        }
+
+    # 데이터가 없으면 절대 임의값을 넣지 않는다.
     return {
-        'profit_growth': profit_growth,
-        'revenue_growth': revenue_growth,
-        'opm_trend': opm_trend,
-        'growth_quality': quality,
-        'profit_samples': len(profit_yoys),
-        'revenue_samples': len(revenue_yoys),
+        "per": np.nan,
+        "source": None,
+        "raw_source": None,
+        "is_fallback": False
     }
+
+
+def _growth_quality_and_reliability(q_dict, q_labels):
+    """
+    Growth Quality:
+      영업이익 성장 50%
+      매출 성장     30%
+      OPM 추세      20%
+
+    PEG Reliability:
+      영업이익 연속성 40
+      성장률 일관성   30
+      매출-이익 동행  20
+      데이터 소스     10
+
+    계산에 필요한 데이터가 없는 경우 해당 항목을 억지로 채우지 않고
+    available weight만 재정규화한다.
+    """
+    result = {
+        "growth_rate": np.nan,
+        "growth_quality": np.nan,
+        "reliability": np.nan,
+        "revenue_growth": np.nan,
+        "operating_growth": np.nan,
+        "opm_trend": np.nan,
+        "opm_latest": np.nan,
+        "profit_continuity": "데이터 부족",
+        "growth_consistency": np.nan,
+        "alignment": "데이터 부족",
+        "growth_samples": 0
+    }
+
+    if not q_dict or len(q_labels) < 2:
+        return result
+
+    rev = [float(q_dict[k].get("revenue", np.nan)) for k in q_labels]
+    prof = [float(q_dict[k].get("profit", np.nan)) for k in q_labels]
+    opm = [
+        (prof[i] / rev[i] * 100) if np.isfinite(prof[i]) and np.isfinite(rev[i]) and rev[i] > 0 else np.nan
+        for i in range(len(q_labels))
+    ]
+
+    # 최근 4개 분기의 YoY: 같은 분기 기준으로 4칸 전 비교
+    yoy_profit, yoy_revenue = [], []
+    for i in range(4, len(q_labels)):
+        p0, p1 = prof[i-4], prof[i]
+        r0, r1 = rev[i-4], rev[i]
+
+        if np.isfinite(p0) and np.isfinite(p1) and abs(p0) > 1e-9:
+            yoy_profit.append((p1 - p0) / abs(p0) * 100)
+        if np.isfinite(r0) and np.isfinite(r1) and abs(r0) > 1e-9:
+            yoy_revenue.append((r1 - r0) / abs(r0) * 100)
+
+    recent_profit = yoy_profit[-4:]
+    recent_revenue = yoy_revenue[-4:]
+
+    if recent_profit:
+        result["operating_growth"] = float(np.median(recent_profit))
+    if recent_revenue:
+        result["revenue_growth"] = float(np.median(recent_revenue))
+
+    # OPM 추세: 최근 4개 평균과 그 이전 4개 평균의 차이
+    valid_opm = [x for x in opm if np.isfinite(x)]
+    if valid_opm:
+        result["opm_latest"] = float(valid_opm[-1])
+    if len(valid_opm) >= 4:
+        recent_opm = float(np.mean(valid_opm[-4:]))
+        prior_opm = float(np.mean(valid_opm[-8:-4])) if len(valid_opm) >= 8 else float(valid_opm[0])
+        result["opm_trend"] = recent_opm - prior_opm
+
+    # Growth Quality: 극단치가 전체 점수를 지배하지 않도록 -50~100으로 제한
+    components = []
+    weights = []
+    if np.isfinite(result["operating_growth"]):
+        components.append(float(np.clip(result["operating_growth"], -50, 100)))
+        weights.append(0.50)
+    if np.isfinite(result["revenue_growth"]):
+        components.append(float(np.clip(result["revenue_growth"], -50, 100)))
+        weights.append(0.30)
+    if np.isfinite(result["opm_trend"]):
+        # OPM 변화는 %p. 성장률과 같은 차원으로 과대 반영하지 않도록 5배까지 제한.
+        components.append(float(np.clip(result["opm_trend"] * 5.0, -50, 50)))
+        weights.append(0.20)
+
+    if components:
+        result["growth_quality"] = float(
+            np.average(components, weights=weights)
+        )
+        result["growth_rate"] = result["growth_quality"]
+
+    # Reliability 40: 영업이익 연속성
+    rel_scores = []
+    if len(prof) >= 4:
+        last4 = prof[-4:]
+        if all(x > 0 for x in last4):
+            if all(last4[i] >= last4[i-1] for i in range(1, 4)):
+                continuity_score = 40
+                result["profit_continuity"] = "최근 4분기 흑자 + 상승"
+            else:
+                continuity_score = 30
+                result["profit_continuity"] = "최근 4분기 연속 흑자"
+        else:
+            continuity_score = 10
+            result["profit_continuity"] = "최근 4분기 중 적자 존재"
+        rel_scores.append(continuity_score)
+
+    # Reliability 30: 성장률 일관성
+    if len(recent_profit) >= 2:
+        std = float(np.std(recent_profit, ddof=0))
+        result["growth_consistency"] = std
+        if std <= 10:
+            consistency_score = 30
+        elif std <= 20:
+            consistency_score = 15
+        else:
+            consistency_score = 5
+        rel_scores.append(consistency_score)
+
+    # Reliability 20: 매출-이익 동행
+    if recent_profit and recent_revenue:
+        pmed = float(np.median(recent_profit))
+        rmed = float(np.median(recent_revenue))
+        if pmed >= 0 and rmed >= 0:
+            alignment_score = 20 if pmed >= rmed else 10
+            result["alignment"] = "동행 + 이익 레버리지" if pmed >= rmed else "동행"
+        else:
+            alignment_score = 0
+            result["alignment"] = "성장 방향 엇갈림"
+        rel_scores.append(alignment_score)
+
+    # 데이터 소스 점수는 호출부에서 Yahoo/Naver 교차검증 여부를 추가
+    # 여기서는 최대 90점까지 산출하고, 호출부에서 +10 또는 +5를 넣는다.
+    result["_reliability_base"] = sum(rel_scores)
+    result["growth_samples"] = len(recent_profit)
+
+    return result
 
 
 def get_pure_real_fundamentals(code, name, df_price_full):
-    is_etf = _classify_security(name)
-    cur_price = float(df_price_full['Close'].iloc[-1]) if not df_price_full.empty else 0.0
-    valuation = _get_real_valuation(code) if not is_etf else {'per': None, 'source': 'ETF · PER 적용 제외', 'type': 'ETF', 'industry_per': None}
+    is_etf = (
+        '리츠' in name or 'TIGER' in name or 'KODEX' in name or
+        'ACE' in name or 'SOL' in name or 'RISE' in name or '맥쿼리' in name
+    )
+    cur_price = (
+        float(df_price_full['Close'].iloc[-1])
+        if not df_price_full.empty else np.nan
+    )
+
+    per_info = _resolve_per(code, name)
+
     fin_payload = {
-        'is_etf': is_etf,
-        'quarterly': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
-        'semiannual': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
-        'annual': {'labels': [], 'profit': [], 'revenue': [], 'net': [], 'opm': [], 'prices': [], 'growth_yoy': []},
-        'growth_model': {
-            'est_per': valuation['per'], 'per_source': valuation['source'], 'per_type': valuation['type'],
-            'industry_per': valuation.get('industry_per'), 'growth_rate': None, 'peg': None,
-            'target_peg_05': None, 'target_peg_10': None,
-            'growth_quality': None, 'profit_growth': None, 'revenue_growth': None, 'opm_trend': None,
-            'data_status': 'ETF · 기업 PER/PEG 평가 제외' if is_etf else '재무데이터 수집 중'
+        "is_etf": is_etf,
+        "quarterly": {
+            "labels": [], "profit": [], "revenue": [], "net": [],
+            "opm": [], "prices": [], "growth_yoy": []
+        },
+        "semiannual": {
+            "labels": [], "profit": [], "revenue": [], "net": [],
+            "opm": [], "prices": [], "growth_yoy": []
+        },
+        "annual": {
+            "labels": [], "profit": [], "revenue": [], "net": [],
+            "opm": [], "prices": [], "growth_yoy": []
+        },
+        "growth_model": {
+            "est_per": per_info["per"],
+            "per_source": per_info["source"],
+            "per_fallback": False,
+            "growth_rate": np.nan,
+            "growth_quality": np.nan,
+            "peg": np.nan,
+            "target_per": np.nan,
+            "target_peg_05": np.nan,
+            "target_peg_10": np.nan,
+            "peg_reliability": np.nan,
+            "revenue_growth": np.nan,
+            "operating_growth": np.nan,
+            "opm_trend": np.nan,
+            "opm_latest": np.nan,
+            "profit_continuity": "데이터 부족",
+            "growth_consistency": np.nan,
+            "alignment": "데이터 부족",
+            "growth_samples": 0
         }
     }
+
     if is_etf:
         return fin_payload
 
     def get_closest_price(date_str):
         try:
-            parts = re.sub(r'[^\d.]', '', str(date_str)).split('.')
-            target_dt = pd.to_datetime(f'{parts[0]}-{int(parts[1]):02d}-28') if len(parts) == 2 else pd.to_datetime(date_str)
+            clean_d = re.sub(r'[^\d.]', '', str(date_str)).strip()
+            parts = clean_d.split('.')
+            if len(parts) == 2:
+                target_dt = pd.to_datetime(
+                    f"{parts[0]}-{int(parts[1]):02d}-28"
+                )
+            else:
+                target_dt = pd.to_datetime(clean_d)
             sub = df_price_full[df_price_full.index <= target_dt]
-            return int(sub['Close'].iloc[-1]) if not sub.empty else int(df_price_full['Close'].iloc[-1])
+            if not sub.empty:
+                return int(sub['Close'].iloc[-1])
+            return int(df_price_full['Close'].iloc[-1])
         except Exception:
             return int(df_price_full['Close'].iloc[-1])
 
-    q_dict, annual_dict = {}, {}
-    for suffix in ['.KS', '.KQ']:
-        try:
-            t = yf.Ticker(f'{code}{suffix}')
+    q_dict = {}
+
+    # Yahoo quarterly statements
+    try:
+        for suffix in ['.KS', '.KQ']:
+            t = yf.Ticker(f"{code}{suffix}")
             q_inc = t.quarterly_income_stmt
             if q_inc is not None and not q_inc.empty:
                 for col in q_inc.columns:
                     lbl = pd.to_datetime(col).strftime('%Y.%m')
-                    rev = float(q_inc.loc['Total Revenue', col] / 1e8) if 'Total Revenue' in q_inc.index and pd.notna(q_inc.loc['Total Revenue', col]) else 0.0
-                    prof = float(q_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in q_inc.index and pd.notna(q_inc.loc['Operating Income', col]) else 0.0
-                    net_m = [idx for idx in q_inc.index if 'Net Income' in str(idx)]
-                    net = float(q_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(q_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0: q_dict[lbl] = {'revenue': rev, 'profit': prof, 'net': net}
-            a_inc = t.income_stmt
-            if a_inc is not None and not a_inc.empty:
-                for col in a_inc.columns:
-                    lbl = pd.to_datetime(col).strftime('%Y')
-                    rev = float(a_inc.loc['Total Revenue', col] / 1e8) if 'Total Revenue' in a_inc.index and pd.notna(a_inc.loc['Total Revenue', col]) else 0.0
-                    prof = float(a_inc.loc['Operating Income', col] / 1e8) if 'Operating Income' in a_inc.index and pd.notna(a_inc.loc['Operating Income', col]) else 0.0
-                    net_m = [idx for idx in a_inc.index if 'Net Income' in str(idx)]
-                    net = float(a_inc.loc[net_m[0], col] / 1e8) if net_m and pd.notna(a_inc.loc[net_m[0], col]) else 0.0
-                    if rev > 0 or prof != 0: annual_dict[lbl] = {'revenue': rev, 'profit': prof, 'net': net}
-            if q_dict: break
-        except Exception as e:
-            logging.warning('재무 데이터 조회 실패 %s: %s', code, e)
+                    rev = (
+                        float(q_inc.loc['Total Revenue', col] / 1e8)
+                        if 'Total Revenue' in q_inc.index
+                        and pd.notna(q_inc.loc['Total Revenue', col])
+                        else np.nan
+                    )
+                    prof = (
+                        float(q_inc.loc['Operating Income', col] / 1e8)
+                        if 'Operating Income' in q_inc.index
+                        and pd.notna(q_inc.loc['Operating Income', col])
+                        else np.nan
+                    )
+                    net_m = [
+                        idx for idx in q_inc.index
+                        if 'Net Income' in str(idx)
+                    ]
+                    net = (
+                        float(q_inc.loc[net_m[0], col] / 1e8)
+                        if net_m and pd.notna(q_inc.loc[net_m[0], col])
+                        else np.nan
+                    )
+                    if np.isfinite(rev) or np.isfinite(prof):
+                        q_dict[lbl] = {
+                            "revenue": round(rev, 0),
+                            "profit": round(prof, 0),
+                            "net": round(net, 0)
+                        }
+                if q_dict:
+                    break
+    except Exception as e:
+        logging.warning(f"Yahoo 재무제표 실패 {code}: {e}")
 
+    # Naver fallback
     if not q_dict:
         try:
-            url = f'https://finance.naver.com/item/main.naver?code={code}'
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=8)
+            url = f"https://finance.naver.com/item/main.naver?code={code}"
+            res = requests.get(
+                url,
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=7
+            )
             tables = pd.read_html(StringIO(res.text), encoding='euc-kr')
             for table in tables:
                 if isinstance(table.columns, pd.MultiIndex):
                     t_idx = table.set_index(table.columns[0])
-                    q_cols = [c for c in table.columns if '분기' in str(c[0])]
+                    q_cols = [
+                        c for c in table.columns
+                        if '분기' in str(c[0])
+                    ]
                     if q_cols:
-                        n_lbls = [str(c[1]).replace('(E)', '').strip() for c in q_cols]
+                        n_lbls = [str(c[1]).strip() for c in q_cols]
+
                         def parse_n(kw):
-                            m = [i for i in t_idx.index if kw in str(i)]
-                            if not m: return [0.0] * len(q_cols)
-                            vals = t_idx.loc[m[0]][q_cols]
-                            out=[]
-                            for v in vals:
-                                raw=re.sub(r'[^\d.-]', '', str(v))
-                                out.append(float(raw) if raw not in ['', '-', '.'] else 0.0)
-                            return out
-                        for l, r, p, n in zip(n_lbls, parse_n('매출액'), parse_n('영업이익'), parse_n('당기순이익')):
-                            if r > 0 or p != 0: q_dict[l] = {'revenue': r, 'profit': p, 'net': n}
-                        break
+                            matches = [
+                                i for i in t_idx.index
+                                if kw in str(i)
+                            ]
+                            if matches:
+                                row = t_idx.loc[matches[0]][q_cols]
+                                vals = []
+                                for v in row:
+                                    s = re.sub(r'[^\d.-]', '', str(v))
+                                    vals.append(
+                                        float(s)
+                                        if s not in ['', '-', '.']
+                                        else np.nan
+                                    )
+                                return vals
+                            return [np.nan] * len(q_cols)
+
+                        n_rev = parse_n('매출액')
+                        n_prof = parse_n('영업이익')
+                        n_net = parse_n('당기순이익')
+
+                        for l, r, p, n in zip(
+                            n_lbls, n_rev, n_prof, n_net
+                        ):
+                            clean_l = l.replace('(E)', '').strip()
+                            if np.isfinite(r) or np.isfinite(p):
+                                q_dict[clean_l] = {
+                                    "revenue": r,
+                                    "profit": p,
+                                    "net": n
+                                }
+                    break
         except Exception as e:
-            logging.warning('Naver 재무데이터 실패 %s: %s', code, e)
+            logging.warning(f"Naver 재무제표 실패 {code}: {e}")
 
     if not q_dict:
-        fin_payload['growth_model']['data_status'] = '재무데이터 부족 · PEG 미계산'
         return fin_payload
 
     sorted_q = sorted(q_dict.keys())
-    q_labels, q_rev, q_prof, q_net, q_opm, q_prices, q_growth_yoy = [], [], [], [], [], [], []
+    q_labels, q_rev, q_prof, q_net = [], [], [], []
+    q_opm, q_prices, q_growth_yoy = [], [], []
+
     for idx, k in enumerate(sorted_q):
-        r, p, n = q_dict[k]['revenue'], q_dict[k]['profit'], q_dict[k]['net']
-        q_labels.append(k); q_rev.append(round(r, 0)); q_prof.append(round(p, 0)); q_net.append(round(n, 0))
-        q_opm.append(round(p / r * 100, 1) if r > 0 else 0.0); q_prices.append(get_closest_price(k))
-        q_growth_yoy.append(round(_growth_pct(p, q_dict[sorted_q[idx-4]]['profit']), 1) if idx >= 4 and q_dict[sorted_q[idx-4]]['profit'] != 0 else None)
+        r = q_dict[k]["revenue"]
+        p = q_dict[k]["profit"]
+        n = q_dict[k]["net"]
 
-    fin_payload['quarterly'] = {'labels': q_labels, 'profit': q_prof, 'revenue': q_rev, 'net': q_net, 'opm': q_opm, 'prices': q_prices, 'growth_yoy': q_growth_yoy}
-    fin_payload['semiannual'] = {k: v[::2] for k, v in fin_payload['quarterly'].items()}
-    fin_payload['annual'] = {'labels': [l[:4] + '년' for l in q_labels[::4]], 'profit': q_prof[::4], 'revenue': q_rev[::4], 'net': q_net[::4], 'opm': q_opm[::4], 'prices': q_prices[::4], 'growth_yoy': q_growth_yoy[::4]}
+        q_labels.append(k)
+        q_rev.append(r)
+        q_prof.append(p)
+        q_net.append(n)
+        q_opm.append(round(p / r * 100, 1) if r > 0 else np.nan)
+        q_prices.append(get_closest_price(k))
 
-    gq = _growth_quality(q_dict, sorted_q, annual_dict)
-    growth_rate = gq['growth_quality']
-    per = valuation['per']
-    peg = (per / growth_rate) if per and growth_rate and growth_rate > 0 else None
-    if per and growth_rate and growth_rate > 0:
-        fair_per = growth_rate
-        bottom_per = growth_rate * 0.5
-        target_10 = int(cur_price * fair_per / per)
-        target_05 = int(cur_price * bottom_per / per)
-    else:
-        target_10 = None; target_05 = None
+        # 4분기 전 같은 분기 대비. 데이터가 없으면 NaN.
+        if idx >= 4:
+            prev_p = q_dict[sorted_q[idx-4]]["profit"]
+            yoy = (
+                round((p - prev_p) / abs(prev_p) * 100, 1)
+                if prev_p != 0 else np.nan
+            )
+        else:
+            yoy = np.nan
+        q_growth_yoy.append(yoy)
 
-    fin_payload['growth_model'].update({
-        'est_per': per, 'growth_rate': growth_rate, 'peg': peg,
-        'target_peg_05': target_05, 'target_peg_10': target_10,
-        'growth_quality': growth_rate, 'profit_growth': gq['profit_growth'],
-        'revenue_growth': gq['revenue_growth'], 'opm_trend': gq['opm_trend'],
-        'data_status': '실제 PER + 지속가능 성장률 계산 완료' if per and growth_rate is not None else '일부 데이터 부족'
+    fin_payload["quarterly"] = {
+        "labels": q_labels,
+        "profit": q_prof,
+        "revenue": q_rev,
+        "net": q_net,
+        "opm": q_opm,
+        "prices": q_prices,
+        "growth_yoy": q_growth_yoy
+    }
+
+    # 반기/연간은 표시용 집계. 실제 성장률은 quarterly 원자료로 계산.
+    fin_payload["semiannual"] = {
+        "labels": q_labels[::2],
+        "profit": q_prof[::2],
+        "revenue": q_rev[::2],
+        "net": q_net[::2],
+        "opm": q_opm[::2],
+        "prices": q_prices[::2],
+        "growth_yoy": q_growth_yoy[::2]
+    }
+    fin_payload["annual"] = {
+        "labels": [l[:4] + "년" for l in q_labels[::4]],
+        "profit": q_prof[::4],
+        "revenue": q_rev[::4],
+        "net": q_net[::4],
+        "opm": q_opm[::4],
+        "prices": q_prices[::4],
+        "growth_yoy": q_growth_yoy[::4]
+    }
+
+    quality = _growth_quality_and_reliability(q_dict, sorted_q)
+
+    # Yahoo + Naver 교차 검증 가능 여부
+    cross_verified = (
+        per_info["source"].startswith("Yahoo")
+        and np.isfinite(_safe_float(
+            _fetch_naver_per(code).get("trailing_pe")
+        ))
+    )
+    base_reliability = quality.get("_reliability_base", np.nan)
+    source_score = 10 if cross_verified else (5 if np.isfinite(base_reliability) else np.nan)
+
+    reliability = (
+        min(100.0, float(base_reliability) + float(source_score))
+        if np.isfinite(base_reliability) and np.isfinite(source_score)
+        else np.nan
+    )
+
+    growth = quality.get("growth_quality", np.nan)
+    per_value = per_info["per"]
+
+    peg = (
+        per_value / growth
+        if np.isfinite(growth) and growth > 0 and np.isfinite(per_value)
+        else np.nan
+    )
+
+    # PEG 1.0 / 0.5 목표 PER -> 목표주가.
+    # 성장률이 양수이고 실제 PER이 존재할 때만 계산.
+    target_per = growth if np.isfinite(growth) and growth > 0 else np.nan
+    target_peg_10 = (
+        int(cur_price * (target_per / per_value))
+        if np.isfinite(cur_price) and np.isfinite(target_per)
+        and per_value > 0
+        else np.nan
+    )
+    target_peg_05 = (
+        int(target_peg_10 * 0.5)
+        if np.isfinite(target_peg_10)
+        else np.nan
+    )
+
+    fin_payload["growth_model"].update({
+        "est_per": per_value,
+        "per_source": per_info["source"],
+        "per_fallback": False,
+        "growth_rate": growth,
+        "growth_quality": growth,
+        "peg": peg,
+        "target_per": target_per,
+        "target_peg_05": target_peg_05,
+        "target_peg_10": target_peg_10,
+        "peg_reliability": reliability,
+        "revenue_growth": quality.get("revenue_growth", np.nan),
+        "operating_growth": quality.get("operating_growth", np.nan),
+        "opm_trend": quality.get("opm_trend", np.nan),
+        "opm_latest": quality.get("opm_latest", np.nan),
+        "profit_continuity": quality.get("profit_continuity", "데이터 부족"),
+        "growth_consistency": quality.get("growth_consistency", np.nan),
+        "alignment": quality.get("alignment", "데이터 부족"),
+        "growth_samples": quality.get("growth_samples", 0)
     })
+
     return fin_payload
 
 
+# ---------- v39.6 안전성 / 추세 / 수급 / 매수상태 ----------
+def calculate_safety_metrics(df, real_dps, current_price):
+    """배당수익률의 과거 위치를 안전성 필터로 변환."""
+    if df.empty or current_price <= 0:
+        return {
+            "yield_5y_avg": np.nan, "yield_5y_max": np.nan,
+            "yield_percentile": np.nan, "safety_score": np.nan,
+            "safety_state": "데이터 부족"
+        }
+
+    y = (real_dps / df['Close'].replace(0, np.nan) * 100).dropna()
+    y5 = y[y.index >= y.index.max() - pd.Timedelta(days=365*5)]
+    if y5.empty:
+        y5 = y
+
+    current_yield = (
+        real_dps / current_price * 100
+        if np.isfinite(real_dps) and current_price > 0
+        else np.nan
+    )
+    avg_y = float(y5.mean()) if not y5.empty else np.nan
+    max_y = float(y5.max()) if not y5.empty else np.nan
+    percentile = float((y5 <= current_yield).mean() * 100) if not y5.empty else np.nan
+
+    # 현재 배당률이 높을수록 안전성 점수 상승.
+    # 단순 최저가 판정이 아니라 과거 분포의 상위 구간을 반영.
+    score = np.clip(percentile, 0, 100) if np.isfinite(percentile) else np.nan
+
+    if np.isfinite(score):
+        state = (
+            "🟢 배당 안전마진 높음" if score >= 80
+            else "🟡 배당 안전마진 보통" if score >= 55
+            else "⚪ 배당 안전마진 낮음"
+        )
+    else:
+        state = "데이터 부족"
+
+    return {
+        "yield_5y_avg": avg_y,
+        "yield_5y_max": max_y,
+        "yield_percentile": percentile,
+        "safety_score": score,
+        "safety_state": state
+    }
+
+
+def calculate_trend_metrics(df):
+    """20/60/200일 추세와 모멘텀. 200거래일 미만이면 부족한 데이터는 제외."""
+    out = {
+        "sma20": np.nan, "sma60": np.nan, "sma200": np.nan,
+        "pct_from_200": np.nan,
+        "ma_alignment": "데이터 부족",
+        "trend_score": np.nan,
+        "golden_cross": False,
+        "death_cross": False,
+        "momentum_3m": np.nan,
+        "trend_state": "데이터 부족"
+    }
+    if df.empty or 'Close' not in df.columns:
+        return out
+
+    close = pd.to_numeric(df['Close'], errors='coerce').dropna()
+    if len(close) < 20:
+        return out
+
+    sma20 = close.rolling(20).mean()
+    sma60 = close.rolling(60).mean()
+    sma200 = close.rolling(200).mean()
+
+    latest = float(close.iloc[-1])
+    out["sma20"] = float(sma20.iloc[-1])
+    out["sma60"] = float(sma60.iloc[-1]) if len(close) >= 60 else np.nan
+    out["sma200"] = float(sma200.iloc[-1]) if len(close) >= 200 else np.nan
+
+    if np.isfinite(out["sma200"]) and out["sma200"] > 0:
+        out["pct_from_200"] = (latest / out["sma200"] - 1) * 100
+
+    if len(close) >= 200:
+        if out["sma20"] > out["sma60"] > out["sma200"]:
+            out["ma_alignment"] = "20>60>200 정배열"
+            alignment_score = 45
+        elif out["sma20"] < out["sma60"] < out["sma200"]:
+            out["ma_alignment"] = "20<60<200 역배열"
+            alignment_score = 10
+        elif out["sma20"] > out["sma200"]:
+            out["ma_alignment"] = "200일선 상회"
+            alignment_score = 35
+        elif out["sma20"] < out["sma200"]:
+            out["ma_alignment"] = "200일선 하회"
+            alignment_score = 20
+        else:
+            alignment_score = 25
+
+        # 200일선과의 거리를 과도하게 보상하지 않음.
+        pct = out["pct_from_200"]
+        distance_score = (
+            10 if -5 <= pct <= 10
+            else 15 if 10 < pct <= 20
+            else 5 if -15 <= pct < -5
+            else 0
+        )
+
+        # 최근 3개월 모멘텀
+        lookback = min(60, len(close)-1)
+        momentum = (latest / float(close.iloc[-1-lookback]) - 1) * 100
+        out["momentum_3m"] = momentum
+        momentum_score = (
+            40 if momentum >= 15
+            else 30 if momentum >= 5
+            else 20 if momentum >= 0
+            else 10 if momentum >= -10
+            else 0
+        )
+
+        out["trend_score"] = float(
+            np.clip(alignment_score + distance_score + momentum_score, 0, 100)
+        )
+
+        out["trend_state"] = (
+            "🟢 상승 추세" if out["trend_score"] >= 70
+            else "🟡 추세 확인" if out["trend_score"] >= 45
+            else "🔴 하락/약세 추세"
+        )
+
+        # 골든/데드크로스 최근 신호
+        gc = (sma20 > sma200) & (sma20.shift(1) <= sma200.shift(1))
+        dc = (sma20 < sma200) & (sma20.shift(1) >= sma200.shift(1))
+        out["golden_cross"] = bool(gc.iloc[-1]) if pd.notna(gc.iloc[-1]) else False
+        out["death_cross"] = bool(dc.iloc[-1]) if pd.notna(dc.iloc[-1]) else False
+
+    return out
+
+
+def get_foreigner_institution_flow(code, days=90):
+    """
+    pykrx가 설치되어 있으면 외국인/기관 순매수 흐름을 가져온다.
+    실패 시 빈 결과를 반환하며 점수에서 제외한다.
+    """
+    result = {
+        "available": False,
+        "foreign_5d": np.nan, "foreign_20d": np.nan, "foreign_60d": np.nan,
+        "institution_5d": np.nan, "institution_20d": np.nan, "institution_60d": np.nan,
+        "foreign_streak": 0,
+        "flow_score": np.nan,
+        "flow_state": "수급 데이터 없음",
+        "source": "미확인"
+    }
+    try:
+        from pykrx import stock
+    except Exception:
+        return result
+
+    try:
+        end = datetime.today().strftime("%Y%m%d")
+        start = (datetime.today() - timedelta(days=days+30)).strftime("%Y%m%d")
+        df_flow = stock.get_market_trading_value_by_date(start, end, code)
+
+        if df_flow is None or df_flow.empty:
+            return result
+
+        df_flow = df_flow.sort_index()
+        foreign_col = next(
+            (c for c in df_flow.columns if '외국인' in str(c)),
+            None
+        )
+        inst_col = next(
+            (c for c in df_flow.columns if '기관' in str(c)),
+            None
+        )
+
+        if foreign_col is None:
+            return result
+
+        result["available"] = True
+        result["source"] = "pykrx"
+
+        for n, key in [(5, "foreign_5d"), (20, "foreign_20d"), (60, "foreign_60d")]:
+            if len(df_flow) >= n:
+                result[key] = float(df_flow[foreign_col].tail(n).sum())
+
+        if inst_col is not None:
+            for n, key in [(5, "institution_5d"), (20, "institution_20d"), (60, "institution_60d")]:
+                if len(df_flow) >= n:
+                    result[key] = float(df_flow[inst_col].tail(n).sum())
+
+        vals = pd.to_numeric(df_flow[foreign_col].tail(10), errors='coerce').fillna(0)
+        streak = 0
+        for v in reversed(vals.tolist()):
+            if v > 0:
+                streak += 1
+            else:
+                break
+        result["foreign_streak"] = streak
+
+        signs = []
+        for k in ["foreign_5d", "foreign_20d", "foreign_60d"]:
+            v = result[k]
+            if np.isfinite(v):
+                signs.append(1 if v > 0 else -1 if v < 0 else 0)
+
+        if signs:
+            result["flow_score"] = float(
+                np.clip(
+                    50 + 20*signs[0] + 15*(signs[1] if len(signs) > 1 else 0)
+                    + 15*(signs[2] if len(signs) > 2 else 0),
+                    0, 100
+                )
+            )
+            result["flow_state"] = (
+                "🟢 외국인 수급 개선" if result["flow_score"] >= 70
+                else "🟡 수급 혼조" if result["flow_score"] >= 45
+                else "🔴 외국인 수급 약세"
+            )
+
+        return result
+    except Exception as e:
+        logging.warning(f"pykrx 수급 실패 {code}: {e}")
+        return result
+
+
+def calculate_earnings_momentum(fin_data):
+    """최근 실적에서 급등/연속상승 신호를 탐지."""
+    q = fin_data.get("quarterly", {})
+    profits = [
+        float(x) for x in q.get("profit", [])
+        if x is not None and np.isfinite(_safe_float(x))
+    ]
+    if len(profits) < 5:
+        return {
+            "signals": [],
+            "score": 0,
+            "state": "실적 모멘텀 데이터 부족"
+        }
+
+    signals = []
+    latest, prev = profits[-1], profits[-2]
+
+    if prev > 0 and latest / prev - 1 >= 0.30:
+        signals.append("🚀 전분기 대비 영업익 30%↑")
+
+    if profits[-5] > 0 and latest / profits[-5] - 1 >= 0.50:
+        signals.append("📈 전년 동기 대비 50%↑")
+
+    last5 = profits[-5:]
+    if all(last5[i] > last5[i-1] for i in range(1, len(last5))):
+        signals.append("📊 4분기 연속 영업익 상승")
+
+    score = min(100, len(signals) * 33)
+    state = (
+        "💥 실적 모멘텀 강함" if score >= 66
+        else "🟢 실적 개선" if score >= 33
+        else "⚪ 실적 모멘텀 약함"
+    )
+    return {"signals": signals, "score": score, "state": state}
+
+
+def determine_buy_state(gm, safety, trend, flow, earnings, current_price, buy_steps):
+    """
+    가치 → 안전성 → 추세 → 수급 순으로 계층적으로 판정.
+    단순 100점 합산이 아니라 PEG를 1차 관문으로 사용한다.
+    """
+    peg = gm.get("peg", np.nan)
+    rel = gm.get("peg_reliability", np.nan)
+    gq = gm.get("growth_quality", np.nan)
+    safety_score = safety.get("safety_score", np.nan)
+    trend_score = trend.get("trend_score", np.nan)
+    flow_score = flow.get("flow_score", np.nan)
+    earnings_score = earnings.get("score", np.nan)
+
+    def _price_text(v):
+        try:
+            x = float(v)
+            return f"{x:,.0f}원" if np.isfinite(x) else "N/A"
+        except Exception:
+            return "N/A"
+
+    if not np.isfinite(peg) or not np.isfinite(gq):
+        state = "⚪ 관찰 — PEG 산출 데이터 부족"
+        return {
+            "state": state, "score": np.nan, "reason": "실제 성장률/이익 데이터 부족",
+            "entry_hint": "재무 데이터가 확보될 때까지 PEG 기반 판단을 보류합니다."
+        }
+
+    # 가치점수: PEG가 낮을수록 높음
+    value_score = (
+        100 if peg <= 0.5 else
+        85 if peg <= 0.75 else
+        70 if peg <= 1.0 else
+        50 if peg <= 1.25 else
+        30 if peg <= 1.5 else 10
+    )
+
+    # 신뢰도가 낮으면 가치판정 강도를 제한
+    if np.isfinite(rel):
+        value_score *= (0.60 + 0.40 * rel / 100)
+
+    # 계층별 확인 점수
+    confirmation = []
+    for v in [safety_score, trend_score, flow_score]:
+        if np.isfinite(v):
+            confirmation.append(float(v))
+    confirmation_score = float(np.mean(confirmation)) if confirmation else np.nan
+
+    score_parts = []
+    if np.isfinite(value_score):
+        score_parts.append((value_score, 0.55))
+    if np.isfinite(confirmation_score):
+        score_parts.append((confirmation_score, 0.25))
+    if np.isfinite(earnings_score):
+        score_parts.append((earnings_score, 0.20))
+
+    if score_parts:
+        final_score = float(np.clip(
+            sum(v * w for v, w in score_parts) / sum(w for _, w in score_parts),
+            0, 100
+        ))
+    else:
+        final_score = np.nan
+
+    # 최종 상태는 PEG/신뢰도를 우선 확인
+    if peg <= 0.75 and (not np.isfinite(rel) or rel >= 70) and final_score >= 75:
+        state = "🟢 적극 매수"
+        entry_hint = f"현재가 {_price_text(current_price)}에서 1차 매수 {_price_text(buy_steps[0])} 기준으로 분할 진입을 고려."
+    elif peg <= 1.0 and final_score >= 60:
+        state = "🟡 분할 매수"
+        entry_hint = f"1차 {_price_text(buy_steps[0])} → 2차 {_price_text(buy_steps[1])} 순서의 분할 진입."
+    elif peg <= 1.0:
+        state = "🔵 저평가 BUT 추세 대기"
+        entry_hint = f"가치는 매력적이나 추세/수급 확인 후 2~3차 가격({_price_text(buy_steps[1])}~{_price_text(buy_steps[2])})을 우선."
+    elif peg <= 1.5:
+        state = "🟠 가격 부담"
+        entry_hint = "성장 대비 가격 부담이 있어 배당 바닥선 또는 더 높은 성장 확인을 기다림."
+    else:
+        state = "🔴 매수 보류"
+        entry_hint = "현재 PEG가 높아 가격 안전마진이 부족함."
+
+    reasons = []
+    reasons.append(f"PEG {peg:.2f}")
+    if np.isfinite(rel):
+        reasons.append(f"신뢰도 {rel:.0f}%")
+    if np.isfinite(trend_score):
+        reasons.append(f"추세 {trend_score:.0f}")
+    if np.isfinite(flow_score):
+        reasons.append(f"수급 {flow_score:.0f}")
+    if earnings_score:
+        reasons.append(f"실적모멘텀 {earnings_score:.0f}")
+
+    return {
+        "state": state,
+        "score": final_score,
+        "reason": " · ".join(reasons),
+        "entry_hint": entry_hint
+    }
+
 # ---------- 동적 가중치 ----------
 def calculate_dynamic_weights(current_yield, growth_rate):
+    if not np.isfinite(current_yield) or not np.isfinite(growth_rate):
+        return np.nan, np.nan, "데이터 부족"
+
     w_div = 0.5
     w_growth = 0.5
     profile_desc = "균형 성장/배당 믹스형"
@@ -681,15 +1383,17 @@ def calculate_dynamic_weights(current_yield, growth_rate):
     return w_div, w_growth, profile_desc
 
 
-# ---------- 다중 기간 연산 & 배당 밴드 ----------
+
+# ---------- v39.6 다중 기간 연산 & 배당/PEG/추세/수급 통합 엔진 ----------
 def calculate_multi_period_engine(code, name):
     now = datetime.today()
     start_date = (now - timedelta(days=365 * 11)).strftime('%Y-%m-%d')
 
     df = get_price_data(code, name, start_date)
     if df.empty:
-        raise ValueError("가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요.")
-
+        raise ValueError(
+            "가격 데이터를 가져올 수 없습니다. 네트워크 상태를 확인하거나 종목 코드를 확인해주세요."
+        )
     if len(df) < 5:
         raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
 
@@ -699,22 +1403,25 @@ def calculate_multi_period_engine(code, name):
 
     real_dps = get_dps_automatically(code, name)
 
+    # 2주 샘플링으로 장기 배당밴드 계산
     df_all = df.resample('2W').last().dropna()
-    rolling_dps, rolling_yields = [], []
-    for dt, row in df_all.iterrows():
-        p = float(row['Close'])
-        rolling_dps.append(real_dps)
-        rolling_yields.append((real_dps / p * 100) if p > 0 else 0.0)
+    df_all['DPS_TTM'] = real_dps
+    df_all['Yield'] = (
+        df_all['DPS_TTM'] / df_all['Close'].replace(0, np.nan) * 100
+    )
 
-    df_all['DPS_TTM'] = rolling_dps
-    df_all['Yield'] = rolling_yields
-    current_yield = float(df_all['Yield'].iloc[-1])
+    current_yield = (
+        float(real_dps / latest_price * 100)
+        if np.isfinite(real_dps) and latest_price > 0
+        else np.nan
+    )
 
+    # RSI
     close_all = df_all['Close']
     delta = close_all.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
+    rs = gain / loss.replace(0, np.nan)
     df_all['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
 
     periods_def = {
@@ -730,9 +1437,20 @@ def calculate_multi_period_engine(code, name):
         sub_df = df_all[df_all.index >= now - timedelta(days=365 * yr)]
         if sub_df.empty:
             sub_df = df_all
-        p_max_yield = float(np.max(sub_df['Yield'])) if not sub_df.empty else 3.67
-        floor_price = int(real_dps / (p_max_yield / 100)) if p_max_yield > 0 else 9536
-        gap = ((latest_price - floor_price) / floor_price) * 100
+
+        p_max_yield = float(sub_df['Yield'].max()) if not sub_df.empty else np.nan
+        floor_price = (
+            int(real_dps / (p_max_yield / 100))
+            if np.isfinite(p_max_yield) and p_max_yield > 0
+            else np.nan
+        )
+        gap = (
+            ((latest_price - floor_price) / floor_price) * 100
+            if np.isfinite(floor_price) and floor_price > 0
+            else np.nan
+        )
+
+        buy_possible = np.isfinite(floor_price) and latest_price <= floor_price
         matrix_table.append({
             "key": key,
             "period": label,
@@ -740,11 +1458,18 @@ def calculate_multi_period_engine(code, name):
             "max_yield": p_max_yield,
             "floor_price": floor_price,
             "gap": gap,
-            "diff_won": latest_price - floor_price,
-            "status": "🎯 매수 가능" if latest_price <= floor_price else "⏳ 대기 (비쌈)",
-            "badge": "bg-red-950 text-red-400 font-bold" if latest_price <= floor_price else "bg-slate-800 text-slate-400"
+            "diff_won": latest_price - floor_price if np.isfinite(floor_price) else np.nan,
+            "status": "🎯 매수 가능" if buy_possible else "⏳ 대기 (비쌈)",
+            "badge": (
+                "bg-red-950 text-red-400 font-bold"
+                if buy_possible
+                else "bg-slate-800 text-slate-400"
+            )
         })
-        period_stats[key] = {"max_yield": p_max_yield, "floor_price": floor_price}
+        period_stats[key] = {
+            "max_yield": p_max_yield,
+            "floor_price": floor_price
+        }
 
     fin_data = get_pure_real_fundamentals(code, name, df)
     gm = fin_data['growth_model']
@@ -752,22 +1477,66 @@ def calculate_multi_period_engine(code, name):
     div_1y = matrix_table[0]['floor_price']
     div_3y = matrix_table[1]['floor_price']
     div_5y = matrix_table[2]['floor_price']
-    growth_rate = gm.get('growth_rate')
-    peg_fair = gm.get('target_peg_10')
-    peg_bottom = gm.get('target_peg_05')
 
-    # 성장 데이터가 없거나 ETF인 경우 PEG 비중을 자동으로 0으로 돌리고 배당 밴드만 사용
-    if growth_rate is None or peg_fair is None or peg_bottom is None:
-        w_div, w_growth = 1.0, 0.0
-        profile_desc = '재무데이터 부족 · 배당가치 단독형'
-        peg_fair = latest_price
-        peg_bottom = latest_price
+    peg_fair = gm.get('target_peg_10', np.nan)
+    peg_bottom = gm.get('target_peg_05', np.nan)
+    growth_rate = gm.get('growth_rate', np.nan)
+
+    # 안전성/추세/수급/실적모멘텀
+    safety = calculate_safety_metrics(df, real_dps, latest_price)
+    trend = calculate_trend_metrics(df)
+    flow = get_foreigner_institution_flow(code)
+    earnings = calculate_earnings_momentum(fin_data)
+
+    # 성장 데이터가 없으면 가중치도 NULL. 임의로 배당/성장 비중을 정하지 않는다.
+    if np.isfinite(growth_rate) and np.isfinite(current_yield):
+        w_div, w_growth, profile_desc = calculate_dynamic_weights(
+            current_yield, growth_rate
+        )
     else:
-        w_div, w_growth, profile_desc = calculate_dynamic_weights(current_yield, growth_rate)
+        w_div, w_growth = np.nan, np.nan
+        profile_desc = "데이터 부족"
 
-    buy_step_1 = int(div_1y * w_div + peg_fair * w_growth)
-    buy_step_2 = int(div_3y * w_div + (peg_fair * 0.6 + peg_bottom * 0.4) * w_growth)
-    buy_step_3 = int(div_5y * w_div + peg_bottom * w_growth)
+    # PEG 데이터가 없으면 PEG 목표가도 NULL. 배당가격을 PEG의 대체값으로 사용하지 않는다.
+    peg_fair_value = peg_fair if np.isfinite(peg_fair) else np.nan
+    peg_bottom_value = peg_bottom if np.isfinite(peg_bottom) else np.nan
+
+    def blend(a, b, wa, wb):
+        vals, weights = [], []
+        if np.isfinite(a):
+            vals.append(float(a)); weights.append(wa)
+        if np.isfinite(b):
+            vals.append(float(b)); weights.append(wb)
+        if not vals:
+            return np.nan
+        return int(np.average(vals, weights=weights))
+
+    if np.isfinite(w_div) and np.isfinite(w_growth):
+        buy_step_1 = blend(div_1y, peg_fair_value, w_div, w_growth)
+        buy_step_2 = blend(
+            div_3y,
+            (peg_fair_value * 0.6 + peg_bottom_value * 0.4)
+            if np.isfinite(peg_fair_value) and np.isfinite(peg_bottom_value)
+            else np.nan,
+            w_div, w_growth
+        )
+        buy_step_3 = blend(div_5y, peg_bottom_value, w_div, w_growth)
+    else:
+        # PEG/Growth 데이터가 없으면 혼합가격을 만들지 않는다.
+        # 배당 데이터 자체가 존재할 때의 독립적인 배당 밴드 가격만 사용한다.
+        buy_step_1 = div_1y
+        buy_step_2 = div_3y
+        buy_step_3 = div_5y
+
+    buy_state = determine_buy_state(
+        gm=gm,
+        safety=safety,
+        trend=trend,
+        flow=flow,
+        earnings=earnings,
+        current_price=latest_price,
+        buy_steps=(buy_step_1, buy_step_2, buy_step_3)
+    )
 
     chart_payload = {
         "dates": df_all.index.strftime('%y.%m.%d').tolist(),
@@ -786,20 +1555,24 @@ def calculate_multi_period_engine(code, name):
         "current_yield": current_yield,
         "current_dps": real_dps,
         "matrix": matrix_table,
-        "buy_step_1": buy_step_1,
-        "buy_step_2": buy_step_2,
-        "buy_step_3": buy_step_3,
+        "buy_step_1": int(buy_step_1) if np.isfinite(buy_step_1) else np.nan,
+        "buy_step_2": int(buy_step_2) if np.isfinite(buy_step_2) else np.nan,
+        "buy_step_3": int(buy_step_3) if np.isfinite(buy_step_3) else np.nan,
         "div_1y": div_1y,
         "div_5y": div_5y,
         "peg_fair": peg_fair,
         "peg_bottom": peg_bottom,
-        "w_div": int(w_div * 100),
-        "w_growth": int(w_growth * 100),
+        "w_div": (int(w_div * 100) if np.isfinite(w_div) else np.nan),
+        "w_growth": (int(w_growth * 100) if np.isfinite(w_growth) else np.nan),
         "profile_desc": profile_desc,
         "fin_data": fin_data,
+        "safety": safety,
+        "trend": trend,
+        "flow": flow,
+        "earnings": earnings,
+        "buy_state": buy_state,
         "chart_payload": chart_payload
     }
-
 
 # ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
@@ -827,20 +1600,42 @@ def generate_v39_dashboard(query, code=None, name=None):
     w_div = data['w_div']
     w_growth = data['w_growth']
     profile_desc = data['profile_desc']
-    per_value = gm.get('est_per')
-    per_text = f"{per_value:.2f}배" if isinstance(per_value, (int, float)) else 'N/A'
-    growth_value = gm.get('growth_quality')
-    growth_text = f"{growth_value:+.1f}%" if isinstance(growth_value, (int, float)) else 'N/A'
-    profit_growth = gm.get('profit_growth')
-    profit_text = f"{profit_growth:+.1f}%" if isinstance(profit_growth, (int, float)) else 'N/A'
-    revenue_growth = gm.get('revenue_growth')
-    revenue_text = f"{revenue_growth:+.1f}%" if isinstance(revenue_growth, (int, float)) else 'N/A'
-    opm_trend = gm.get('opm_trend')
-    opm_text = f"{opm_trend:+.1f}%p" if isinstance(opm_trend, (int, float)) else 'N/A'
-    peg_value = gm.get('peg')
-    peg_text = f"{peg_value:.2f}" if isinstance(peg_value, (int, float)) else 'N/A'
+
+    # v39.6 통합 분석 지표
+    safety = data.get('safety', {})
+    trend = data.get('trend', {})
+    flow = data.get('flow', {})
+    earnings = data.get('earnings', {})
+    buy_state = data.get('buy_state', {})
+    peg_rel = gm.get('peg_reliability', np.nan)
+    growth_quality = gm.get('growth_quality', np.nan)
+    per_value = gm.get('est_per', np.nan)
     per_source = gm.get('per_source', '데이터 없음')
-    data_status = gm.get('data_status', '')
+    revenue_growth = gm.get('revenue_growth', np.nan)
+    operating_growth = gm.get('operating_growth', np.nan)
+    opm_trend = gm.get('opm_trend', np.nan)
+    trend_score = trend.get('trend_score', np.nan)
+    pct_from_200 = trend.get('pct_from_200', np.nan)
+    flow_score = flow.get('flow_score', np.nan)
+    foreign_streak = flow.get('foreign_streak', 0)
+    safety_score = safety.get('safety_score', np.nan)
+    earnings_score = earnings.get('score', 0)
+
+    def fmt_num(v, digits=1, suffix=''):
+        try:
+            return f"{float(v):.{digits}f}{suffix}" if np.isfinite(float(v)) else 'N/A'
+        except Exception:
+            return 'N/A'
+
+    def fmt_price(v):
+        try:
+            x = float(v)
+            return f"{x:,.0f}원" if np.isfinite(x) else 'N/A'
+        except Exception:
+            return 'N/A'
+
+    def fmt_pct(v, digits=2):
+        return fmt_num(v, digits, '%')
 
     # IMPORTANT: 중첩 f-string + JavaScript 중괄호로 인한 SyntaxError 방지
     matrix_rows = "".join(
@@ -848,10 +1643,10 @@ def generate_v39_dashboard(query, code=None, name=None):
         <tr onclick="changePeriod('{m['key']}')" class="hover:bg-slate-800/60 transition">
             <td class="py-2.5 px-2.5 font-bold text-slate-200">{m['period']}</td>
             <td class="py-2.5 px-2.5 text-cyan-300">{m['allocation']}</td>
-            <td class="py-2.5 px-2.5 text-blue-400 font-bold">{m['max_yield']:.2f}%</td>
-            <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{m['floor_price']:,}원</td>
+            <td class="py-2.5 px-2.5 text-blue-400 font-bold">{fmt_pct(m['max_yield'], 2)}</td>
+            <td class="py-2.5 px-2.5 text-red-400 font-black text-sm">{fmt_price(m['floor_price'])}</td>
             <td class="py-2.5 px-2.5 {('text-red-400 font-bold' if m['gap'] <= 0 else ('text-amber-400' if m['gap'] <= 3 else 'text-slate-300'))}">
-                {m['diff_won']:+,}원 ({m['gap']:+.1f}%)
+                {fmt_price(m['diff_won'])} ({fmt_pct(m['gap'], 1)})
             </td>
             <td class="py-2.5 px-2.5 text-center">
                 <span class="px-2 py-0.5 text-[10px] rounded {m['badge']}">{m['status']}</span>
@@ -907,12 +1702,12 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <h1 class="text-2xl font-extrabold text-white tracking-tight">{data['name']}</h1>
                     <span class="text-xs px-2.5 py-1 bg-slate-800 text-blue-400 font-mono rounded-lg border border-slate-700">{code}</span>
                     <span class="text-xs px-3 py-1 bg-indigo-950 text-indigo-300 font-bold rounded-lg border border-indigo-800">
-                        {profile_desc} (배당 {w_div}% : 성장 {w_growth}%)
+                        {profile_desc} (배당 {fmt_num(w_div, 0, '%')} : 성장 {fmt_num(w_growth, 0, '%')})
                     </span>
                 </div>
                 <p class="text-xs text-slate-400 mt-2">
                     현재 주가: <b class="text-white text-base font-extrabold">{data['latest_price']:,}원</b> ({data['change_pct']:+.2f}%) 
-                    · 현재 배당수익률: <b class="text-blue-400 text-base font-extrabold">{data['current_yield']:.2f}%</b> (연간 실시간 DPS {data['current_dps']:,.0f}원)
+                    · 현재 배당수익률: <b class="text-blue-400 text-base font-extrabold">{fmt_pct(data['current_yield'], 2)}</b> (연간 실시간 DPS {fmt_price(data['current_dps'])})
                 </p>
             </div>
             <div>
@@ -930,43 +1725,80 @@ def generate_v39_dashboard(query, code=None, name=None):
                     <span class="px-2.5 py-0.5 text-xs font-black rounded-lg bg-indigo-600 text-white">마스터 매매 결론</span>
                     <h2 class="text-base md:text-lg font-black text-indigo-200 tracking-tight">종목 맞춤형 동적 가중치 3단계 매수가이드</h2>
                 </div>
-                <span class="text-xs text-slate-400">실데이터 기반 · 배당 {w_div}% + 실적 PEG {w_growth}% 최적 조합</span>
+                <span class="text-xs text-slate-400">실데이터 기반 · 배당 {fmt_num(w_div, 0, '%')} + 실적 PEG {fmt_num(w_growth, 0, '%')} + 안전성/추세/수급 통합</span>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-blue-400 font-bold">1차 매수 (30% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b1:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 1년 바닥 + PEG 적정가 ({w_div}:{w_growth})</p>
+                    <h3 class="text-lg font-black text-white mt-0.5">{fmt_price(b1)}</h3>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 1년 바닥 + PEG 적정가 ({fmt_num(w_div, 0)}:{fmt_num(w_growth, 0)})</p>
                 </div>
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-emerald-400 font-bold">2차 매수 (30% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b2:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 3년 바닥 + PEG 중간 ({w_div}:{w_growth})</p>
+                    <h3 class="text-lg font-black text-white mt-0.5">{fmt_price(b2)}</h3>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 3년 바닥 + PEG 중간 ({fmt_num(w_div, 0)}:{fmt_num(w_growth, 0)})</p>
                 </div>
                 <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
                     <p class="text-xs text-red-400 font-bold">3차 매수 (40% 비중)</p>
-                    <h3 class="text-lg font-black text-white mt-0.5">{b3:,}원</h3>
-                    <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 대바닥 + PEG 바닥가 ({w_div}:{w_growth})</p>
+                    <h3 class="text-lg font-black text-white mt-0.5">{fmt_price(b3)}</h3>
+                    <p class="text-[10px] text-slate-400 mt-0.5">배당 5년 대바닥 + PEG 바닥가 ({fmt_num(w_div, 0)}:{fmt_num(w_growth, 0)})</p>
                 </div>
             </div>
         </div>
 
-        <!-- [v39.5] 실제 PER + 지속가능 성장률 + PEG 품질 카드 -->
-        <div class="bg-slate-900/90 p-4 rounded-2xl border border-emerald-500/30 shadow-xl space-y-3">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-2">
+        <!-- v39.6 가치/안전성/추세/수급 통합 판단 -->
+        <div class="bg-slate-900/90 p-4 rounded-2xl border border-slate-800 shadow-xl space-y-3">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-2 border-b border-slate-800 pb-3">
                 <div>
-                    <h2 class="text-sm md:text-base font-black text-emerald-300">🧮 v39.5 실적 기반 밸류에이션</h2>
-                    <p class="text-[10px] text-slate-500 mt-1">고정 PER 15배/고정 성장률 제거 · 실제 데이터 우선</p>
+                    <p class="text-[11px] text-slate-400 font-bold">v39.6 계층형 투자 판단</p>
+                    <h2 class="text-xl font-black text-white mt-0.5">{buy_state.get('state', '관찰')}</h2>
+                    <p class="text-[11px] text-slate-400 mt-1">{buy_state.get('reason', '')}</p>
                 </div>
-                <span class="text-[10px] text-slate-500">{data_status}</span>
+                <div class="text-right">
+                    <p class="text-[10px] text-slate-500">종합 확인점수</p>
+                    <p class="text-2xl font-black text-indigo-300">{fmt_num(buy_state.get('score'), 0, '/100')}</p>
+                </div>
             </div>
-            <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">PER</p><b class="text-lg text-white">{per_text}</b><p class="text-[9px] text-slate-500 mt-1">{per_source}</p></div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">Growth Quality</p><b class="text-lg text-emerald-400">{growth_text}</b><p class="text-[9px] text-slate-500 mt-1">매출30 · 영업익50 · OPM20</p></div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">영업익 성장</p><b class="text-lg text-emerald-300">{profit_text}</b></div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">매출 성장</p><b class="text-lg text-cyan-300">{revenue_text}</b></div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">OPM 추세</p><b class="text-lg text-amber-300">{opm_text}</b></div>
-                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800"><p class="text-[10px] text-slate-400">PEG</p><b class="text-lg text-indigo-300">{peg_text}</b></div>
+
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <p class="text-[10px] text-slate-500">가치 · PEG</p>
+                    <p class="text-lg font-black text-emerald-400">{fmt_num(gm.get('peg'), 2)}</p>
+                    <p class="text-[9px] text-slate-500">PER {fmt_num(per_value, 1)}배</p>
+                </div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <p class="text-[10px] text-slate-500">PEG 신뢰도</p>
+                    <p class="text-lg font-black text-cyan-400">{fmt_num(peg_rel, 0, '%')}</p>
+                    <p class="text-[9px] text-slate-500 truncate">{per_source}</p>
+                </div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <p class="text-[10px] text-slate-500">Growth Quality</p>
+                    <p class="text-lg font-black text-blue-400">{fmt_num(growth_quality, 1, '%')}</p>
+                    <p class="text-[9px] text-slate-500">매출 {fmt_num(revenue_growth, 1, '%')} · 영업익 {fmt_num(operating_growth, 1, '%')}</p>
+                </div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <p class="text-[10px] text-slate-500">추세</p>
+                    <p class="text-lg font-black text-amber-400">{fmt_num(trend_score, 0, '/100')}</p>
+                    <p class="text-[9px] text-slate-500">200일선 대비 {fmt_num(pct_from_200, 1, '%')}</p>
+                </div>
+                <div class="bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+                    <p class="text-[10px] text-slate-500">안전성 · 수급</p>
+                    <p class="text-lg font-black text-violet-400">{fmt_num(safety_score, 0, '/100')}</p>
+                    <p class="text-[9px] text-slate-500">수급 {fmt_num(flow_score, 0, '/100')} · 외인 {foreign_streak}일</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-[10px]">
+                <div class="bg-slate-950/50 rounded-lg px-3 py-2 text-slate-300">
+                    <b class="text-emerald-400">실적 모멘텀</b> · {earnings.get('state', '데이터 부족')}
+                    <span class="text-slate-500"> ({earnings_score:.0f}/100)</span>
+                </div>
+                <div class="bg-slate-950/50 rounded-lg px-3 py-2 text-slate-300">
+                    <b class="text-amber-400">OPM 추세</b> · {fmt_num(opm_trend, 1, '%p')}
+                </div>
+                <div class="bg-slate-950/50 rounded-lg px-3 py-2 text-slate-300">
+                    <b class="text-blue-400">매수 힌트</b> · {buy_state.get('entry_hint', '')}
+                </div>
             </div>
         </div>
 
@@ -1402,7 +2234,7 @@ def generate_v39_dashboard(query, code=None, name=None):
 
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(html_content)
-    print(f"✅ [{data['name']}] v39.4 대시보드 렌더링 완료!")
+    print(f"✅ [{data['name']}] v39.6 대시보드 렌더링 완료!")
     return html_content
 
 

@@ -301,43 +301,237 @@ def _get_naver_monthly_price(code):
 
 
 # ---------- 가격 데이터 다중 소스 폴백 ----------
+def _get_naver_current_price(code):
+    """네이버 현재가. 데이터 교차검증용이며 실패하면 NULL."""
+    try:
+        url = f"https://finance.naver.com/item/main.naver?code={code}"
+        res = requests.get(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=7
+        )
+        res.encoding = 'cp949'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        el = soup.select_one("p.no_today span.blind")
+        if el:
+            s = re.sub(r'[^\d]', '', el.get_text())
+            if s:
+                return float(s)
+    except Exception as e:
+        logging.warning(f"Naver 현재가 확인 실패 {code}: {e}")
+    return np.nan
+
+
+def _clean_price_frame(df):
+    """가격 프레임을 숫자형/단일 날짜 인덱스로 정규화. 값 생성/대체는 하지 않는다."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    needed = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if not all(c in out.columns for c in needed):
+        return pd.DataFrame()
+
+    out = out[needed].copy()
+    for c in needed:
+        out[c] = pd.to_numeric(out[c], errors='coerce')
+
+    if isinstance(out.index, pd.DatetimeIndex):
+        try:
+            if out.index.tz is not None:
+                out.index = out.index.tz_localize(None)
+        except Exception:
+            pass
+
+    out = out[~out.index.duplicated(keep='last')]
+    out = out.sort_index()
+    out = out.dropna(subset=['Close'])
+    out = out[out['Close'] > 0]
+
+    return out
+
+
+def _price_source_is_plausible(df, code):
+    """
+    가격 소스 검증.
+    임의의 가격을 보정하지 않고, 다른 실시간 소스와 큰 차이가 나면 해당 소스를 폐기한다.
+    """
+    if df is None or df.empty:
+        return False
+
+    latest = _safe_float(df['Close'].iloc[-1])
+    if not np.isfinite(latest) or latest <= 0:
+        return False
+
+    naver_price = _get_naver_current_price(code)
+    if np.isfinite(naver_price) and naver_price > 0:
+        # 데이터 소스 간 현재가가 크게 다르면 소스 자체를 사용하지 않는다.
+        relative_gap = abs(latest / naver_price - 1.0)
+        if relative_gap > 0.05:
+            logging.warning(
+                f"가격 소스 불일치 {code}: candidate={latest:,.0f}, "
+                f"naver={naver_price:,.0f}, gap={relative_gap:.2%}"
+            )
+            return False
+
+    # 가격 시계열 자체에 비정상적인 100배/0.01배 단위 점프가 있는지 검사.
+    close = pd.to_numeric(df['Close'], errors='coerce').dropna()
+    if len(close) >= 2:
+        ratios = close / close.shift(1)
+        ratios = ratios.replace([np.inf, -np.inf], np.nan).dropna()
+        suspicious = ratios[(ratios > 50) | (ratios < 1 / 50)]
+        if not suspicious.empty:
+            logging.warning(
+                f"가격 시계열 단위 이상 의심 {code}: {len(suspicious)}건"
+            )
+            return False
+
+    return True
+
+
 def get_price_data(code, name, start_date):
     """
-    가격 데이터를 다양한 소스에서 순차적으로 시도하여 가져온다.
-    Returns: DataFrame with index=Date, columns=['Open','High','Low','Close','Volume']
+    가격 데이터 수집 우선순위:
+      1) yfinance raw Close (Yahoo의 Close는 split 기준이 반영된 가격)
+      2) FinanceDataReader
+      3) Naver 월봉
+
+    중요:
+    - auto_adjust=True를 사용하지 않는다.
+      auto_adjust=True는 배당까지 가격에 반영하므로 배당수익률 계산용 가격으로 부적절하다.
+    - auto_adjust=False + actions=True로 Close와 배당/분할 이벤트를 함께 확보한다.
+    - 가격을 임의로 배수 보정하지 않는다. 이상하면 해당 소스를 버리고 다음 소스를 시도한다.
     """
-    # 1) FinanceDataReader (Yahoo)
+    # 1) yfinance
+    for suffix in ['.KS', '.KQ']:
+        ticker = f"{code}{suffix}"
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            raw = yf_ticker.history(
+                start=start_date,
+                auto_adjust=False,
+                actions=True,
+                repair=True
+            )
+
+            if raw is None or raw.empty:
+                continue
+
+            df = _clean_price_frame(raw)
+            if _price_source_is_plausible(df, code):
+                # 이후 historical dividend/split 계산에 사용할 수 있도록 이벤트를 보존
+                if 'Dividends' in raw.columns:
+                    divs = pd.to_numeric(raw['Dividends'], errors='coerce').fillna(0.0)
+                    divs.index = pd.to_datetime(divs.index)
+                    try:
+                        if divs.index.tz is not None:
+                            divs.index = divs.index.tz_localize(None)
+                    except Exception:
+                        pass
+                    df.attrs['dividends'] = divs.reindex(df.index).fillna(0.0)
+
+                if 'Stock Splits' in raw.columns:
+                    splits = pd.to_numeric(raw['Stock Splits'], errors='coerce').fillna(0.0)
+                    splits.index = pd.to_datetime(splits.index)
+                    try:
+                        if splits.index.tz is not None:
+                            splits.index = splits.index.tz_localize(None)
+                    except Exception:
+                        pass
+                    df.attrs['stock_splits'] = splits.reindex(df.index).fillna(0.0)
+
+                df.attrs['price_source'] = f"Yahoo Finance {ticker}"
+                return df
+
+        except Exception as e:
+            logging.warning(f"yfinance 가격 실패 {ticker}: {e}")
+
+    # 2) FinanceDataReader
     try:
         df = fdr.DataReader(code, start=start_date)
-        if df is not None and not df.empty:
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        df = _clean_price_frame(df)
+        if _price_source_is_plausible(df, code):
+            df.attrs['price_source'] = "FinanceDataReader"
             return df
     except Exception as e:
-        logging.warning(f"FinanceDataReader failed: {e}")
+        logging.warning(f"FinanceDataReader 가격 실패 {code}: {e}")
 
-    # 2) yfinance 직접 호출
-    for suffix in ['.KS', '.KQ']:
-        try:
-            ticker = f"{code}{suffix}"
-            yf_ticker = yf.Ticker(ticker)
-            df = yf_ticker.history(start=start_date, auto_adjust=False)
-            if df is not None and not df.empty:
-                df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                df.index = df.index.tz_localize(None)
-                return df
-        except Exception as e:
-            logging.warning(f"yfinance failed for {ticker}: {e}")
-
-    # 3) 네이버 금융 월봉 데이터
-    df_naver = _get_naver_monthly_price(code)
-    if not df_naver.empty:
-        cutoff = datetime.today() - timedelta(days=365 * 11)
-        df_naver = df_naver[df_naver.index >= cutoff]
-        return df_naver
+    # 3) Naver 월봉
+    try:
+        df_naver = _get_naver_monthly_price(code)
+        if not df_naver.empty:
+            cutoff = datetime.today() - timedelta(days=365 * 11)
+            df_naver = df_naver[df_naver.index >= cutoff]
+            df_naver = _clean_price_frame(df_naver)
+            if _price_source_is_plausible(df_naver, code):
+                df_naver.attrs['price_source'] = "Naver Finance monthly"
+                return df_naver
+    except Exception as e:
+        logging.warning(f"Naver 가격 실패 {code}: {e}")
 
     return pd.DataFrame()
 
 
+def _get_historical_dividend_ttm(df_price):
+    """
+    현재 DPS를 과거 모든 날짜에 복사하지 않는다.
+
+    Yahoo의 raw Dividends + Stock Splits를 사용하여
+    각 날짜의 TTM DPS를 현재 주식 수 기준으로 환산한다.
+
+    데이터가 없으면 해당 날짜는 NaN이다.
+    """
+    idx = pd.DatetimeIndex(df_price.index)
+    out = pd.Series(np.nan, index=idx, dtype=float)
+
+    divs = df_price.attrs.get('dividends')
+    splits = df_price.attrs.get('stock_splits')
+
+    if divs is None or divs.empty:
+        return out
+
+    divs = pd.to_numeric(divs, errors='coerce').fillna(0.0)
+    divs = divs[divs > 0].sort_index()
+
+    if divs.empty:
+        return out
+
+    if splits is None or splits.empty:
+        splits = pd.Series(0.0, index=idx)
+    else:
+        splits = pd.to_numeric(splits, errors='coerce').fillna(0.0).sort_index()
+
+    # 각 배당일 이후 발생한 주식분할을 누적하여
+    # 과거 배당금을 현재 주식 1주 기준으로 환산.
+    adjusted_divs = {}
+    for d, div in divs.items():
+        future_splits = splits[
+            (splits.index > d) &
+            (splits.index <= idx.max()) &
+            (splits > 0)
+        ]
+        factor = float(future_splits.prod()) if not future_splits.empty else 1.0
+        if np.isfinite(factor) and factor > 0:
+            adjusted_divs[pd.Timestamp(d)] = float(div) / factor
+
+    if not adjusted_divs:
+        return out
+
+    adj_divs = pd.Series(adjusted_divs).sort_index()
+
+    # 날짜별 최근 365일 배당 합계.
+    for date in idx:
+        window = adj_divs[
+            (adj_divs.index > date - pd.Timedelta(days=365)) &
+            (adj_divs.index <= date)
+        ]
+        if not window.empty:
+            out.loc[date] = float(window.sum())
+
+    return out
+
+
+# ---------- DPS 자동 크롤링 ----------
 # ---------- DPS 자동 크롤링 ----------
 def get_dps_automatically(code, name):
     for suffix in ['.KS', '.KQ']:
@@ -1146,7 +1340,7 @@ def get_foreigner_institution_flow(code, days=90):
         "available": False,
         "foreign_5d": np.nan, "foreign_20d": np.nan, "foreign_60d": np.nan,
         "institution_5d": np.nan, "institution_20d": np.nan, "institution_60d": np.nan,
-        "foreign_streak": 0,
+        "foreign_streak": np.nan,
         "flow_score": np.nan,
         "flow_state": "수급 데이터 없음",
         "source": "미확인"
@@ -1234,7 +1428,7 @@ def calculate_earnings_momentum(fin_data):
     if len(profits) < 5:
         return {
             "signals": [],
-            "score": 0,
+            "score": np.nan,
             "state": "실적 모멘텀 데이터 부족"
         }
 
@@ -1397,15 +1591,26 @@ def calculate_multi_period_engine(code, name):
     if len(df) < 5:
         raise ValueError("충분한 가격 데이터를 확보하지 못했습니다.")
 
-    latest_price = int(df['Close'].iloc[-1])
-    prev_price = int(df['Close'].iloc[-2])
-    change_pct = ((latest_price - prev_price) / prev_price) * 100
+    latest_price = _safe_float(df['Close'].iloc[-1])
+    prev_price = _safe_float(df['Close'].iloc[-2])
+
+    if not np.isfinite(latest_price) or latest_price <= 0:
+        raise ValueError("현재가 데이터가 유효하지 않습니다.")
+
+    change_pct = (
+        ((latest_price - prev_price) / prev_price) * 100
+        if np.isfinite(prev_price) and prev_price > 0
+        else np.nan
+    )
 
     real_dps = get_dps_automatically(code, name)
 
-    # 2주 샘플링으로 장기 배당밴드 계산
-    df_all = df.resample('2W').last().dropna()
-    df_all['DPS_TTM'] = real_dps
+    # 과거 각 시점의 실제 TTM DPS를 사용.
+    # 현재 DPS 하나를 11년치 가격에 복사하지 않는다.
+    historical_dps = _get_historical_dividend_ttm(df)
+
+    df_all = df.resample('2W').last().dropna(subset=['Close']).copy()
+    df_all['DPS_TTM'] = historical_dps.reindex(df_all.index)
     df_all['Yield'] = (
         df_all['DPS_TTM'] / df_all['Close'].replace(0, np.nan) * 100
     )
@@ -1416,13 +1621,13 @@ def calculate_multi_period_engine(code, name):
         else np.nan
     )
 
-    # RSI
+    # RSI: 데이터가 충분하지 않은 구간은 NULL.
     close_all = df_all['Close']
     delta = close_all.diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
-    df_all['RSI'] = (100 - (100 / (1 + rs))).fillna(50)
+    df_all['RSI'] = 100 - (100 / (1 + rs))
 
     periods_def = {
         '1Y': ('1년 (단기 바닥)', 1, '1차 매수'),
@@ -1433,24 +1638,47 @@ def calculate_multi_period_engine(code, name):
 
     matrix_table = []
     period_stats = {}
-    for key, (label, yr, alloc) in periods_def.items():
-        sub_df = df_all[df_all.index >= now - timedelta(days=365 * yr)]
-        if sub_df.empty:
-            sub_df = df_all
 
-        p_max_yield = float(sub_df['Yield'].max()) if not sub_df.empty else np.nan
-        floor_price = (
-            int(real_dps / (p_max_yield / 100))
-            if np.isfinite(p_max_yield) and p_max_yield > 0
-            else np.nan
-        )
+    for key, (label, yr, alloc) in periods_def.items():
+        sub_df = df_all[
+            df_all.index >= now - timedelta(days=365 * yr)
+        ].copy()
+
+        # 해당 기간 데이터가 없으면 전체기간으로 대체하지 않는다.
+        if sub_df.empty:
+            p_max_yield = np.nan
+            floor_price = np.nan
+        else:
+            valid_yields = pd.to_numeric(
+                sub_df['Yield'], errors='coerce'
+            ).dropna()
+
+            p_max_yield = (
+                float(valid_yields.max())
+                if not valid_yields.empty
+                else np.nan
+            )
+
+            floor_price = (
+                float(real_dps / (p_max_yield / 100))
+                if np.isfinite(real_dps)
+                and real_dps > 0
+                and np.isfinite(p_max_yield)
+                and p_max_yield > 0
+                else np.nan
+            )
+
         gap = (
             ((latest_price - floor_price) / floor_price) * 100
             if np.isfinite(floor_price) and floor_price > 0
             else np.nan
         )
 
-        buy_possible = np.isfinite(floor_price) and latest_price <= floor_price
+        buy_possible = (
+            np.isfinite(floor_price)
+            and latest_price <= floor_price
+        )
+
         matrix_table.append({
             "key": key,
             "period": label,
@@ -1458,14 +1686,25 @@ def calculate_multi_period_engine(code, name):
             "max_yield": p_max_yield,
             "floor_price": floor_price,
             "gap": gap,
-            "diff_won": latest_price - floor_price if np.isfinite(floor_price) else np.nan,
-            "status": "🎯 매수 가능" if buy_possible else "⏳ 대기 (비쌈)",
+            "diff_won": (
+                latest_price - floor_price
+                if np.isfinite(floor_price)
+                else np.nan
+            ),
+            "status": (
+                "🎯 매수 가능"
+                if buy_possible
+                else "⏳ 대기 (비쌈)"
+                if np.isfinite(floor_price)
+                else "⚪ 데이터 없음"
+            ),
             "badge": (
                 "bg-red-950 text-red-400 font-bold"
                 if buy_possible
                 else "bg-slate-800 text-slate-400"
             )
         })
+
         period_stats[key] = {
             "max_yield": p_max_yield,
             "floor_price": floor_price
@@ -1482,13 +1721,13 @@ def calculate_multi_period_engine(code, name):
     peg_bottom = gm.get('target_peg_05', np.nan)
     growth_rate = gm.get('growth_rate', np.nan)
 
-    # 안전성/추세/수급/실적모멘텀
-    safety = calculate_safety_metrics(df, real_dps, latest_price)
+    safety = calculate_safety_metrics(
+        df, real_dps, latest_price
+    )
     trend = calculate_trend_metrics(df)
     flow = get_foreigner_institution_flow(code)
     earnings = calculate_earnings_momentum(fin_data)
 
-    # 성장 데이터가 없으면 가중치도 NULL. 임의로 배당/성장 비중을 정하지 않는다.
     if np.isfinite(growth_rate) and np.isfinite(current_yield):
         w_div, w_growth, profile_desc = calculate_dynamic_weights(
             current_yield, growth_rate
@@ -1497,36 +1736,58 @@ def calculate_multi_period_engine(code, name):
         w_div, w_growth = np.nan, np.nan
         profile_desc = "데이터 부족"
 
-    # PEG 데이터가 없으면 PEG 목표가도 NULL. 배당가격을 PEG의 대체값으로 사용하지 않는다.
-    peg_fair_value = peg_fair if np.isfinite(peg_fair) else np.nan
-    peg_bottom_value = peg_bottom if np.isfinite(peg_bottom) else np.nan
+    peg_fair_value = (
+        peg_fair if np.isfinite(peg_fair) else np.nan
+    )
+    peg_bottom_value = (
+        peg_bottom if np.isfinite(peg_bottom) else np.nan
+    )
 
     def blend(a, b, wa, wb):
-        vals, weights = [], []
-        if np.isfinite(a):
-            vals.append(float(a)); weights.append(wa)
-        if np.isfinite(b):
-            vals.append(float(b)); weights.append(wb)
-        if not vals:
+        # 두 가치와 두 가중치가 모두 존재할 때만 혼합.
+        if not all(np.isfinite(x) for x in [a, b, wa, wb]):
             return np.nan
-        return int(np.average(vals, weights=weights))
+        if wa < 0 or wb < 0 or (wa + wb) <= 0:
+            return np.nan
+        return float(np.average(
+            [float(a), float(b)],
+            weights=[float(wa), float(wb)]
+        ))
 
+    # PEG/Growth 데이터가 없으면 매수가도 NULL.
+    # 배당가격을 PEG 가격의 대체값으로 사용하지 않는다.
     if np.isfinite(w_div) and np.isfinite(w_growth):
-        buy_step_1 = blend(div_1y, peg_fair_value, w_div, w_growth)
+        buy_step_1 = blend(
+            div_1y,
+            peg_fair_value,
+            w_div,
+            w_growth
+        )
+
+        middle_peg = (
+            peg_fair_value * 0.6 + peg_bottom_value * 0.4
+            if np.isfinite(peg_fair_value)
+            and np.isfinite(peg_bottom_value)
+            else np.nan
+        )
+
         buy_step_2 = blend(
             div_3y,
-            (peg_fair_value * 0.6 + peg_bottom_value * 0.4)
-            if np.isfinite(peg_fair_value) and np.isfinite(peg_bottom_value)
-            else np.nan,
-            w_div, w_growth
+            middle_peg,
+            w_div,
+            w_growth
         )
-        buy_step_3 = blend(div_5y, peg_bottom_value, w_div, w_growth)
+
+        buy_step_3 = blend(
+            div_5y,
+            peg_bottom_value,
+            w_div,
+            w_growth
+        )
     else:
-        # PEG/Growth 데이터가 없으면 혼합가격을 만들지 않는다.
-        # 배당 데이터 자체가 존재할 때의 독립적인 배당 밴드 가격만 사용한다.
-        buy_step_1 = div_1y
-        buy_step_2 = div_3y
-        buy_step_3 = div_5y
+        buy_step_1 = np.nan
+        buy_step_2 = np.nan
+        buy_step_3 = np.nan
 
     buy_state = determine_buy_state(
         gm=gm,
@@ -1540,10 +1801,22 @@ def calculate_multi_period_engine(code, name):
 
     chart_payload = {
         "dates": df_all.index.strftime('%y.%m.%d').tolist(),
-        "prices": df_all['Close'].astype(int).tolist(),
-        "yields": [round(float(v), 2) for v in df_all['Yield']],
-        "rsis": [round(float(v), 1) for v in df_all['RSI']],
-        "dps": df_all['DPS_TTM'].tolist(),
+        "prices": [
+            float(v) if np.isfinite(v) else None
+            for v in df_all['Close']
+        ],
+        "yields": [
+            float(v) if np.isfinite(v) else None
+            for v in df_all['Yield']
+        ],
+        "rsis": [
+            float(v) if np.isfinite(v) else None
+            for v in df_all['RSI']
+        ],
+        "dps": [
+            float(v) if np.isfinite(v) else None
+            for v in df_all['DPS_TTM']
+        ],
         "stats": period_stats
     }
 
@@ -1554,16 +1827,37 @@ def calculate_multi_period_engine(code, name):
         "change_pct": change_pct,
         "current_yield": current_yield,
         "current_dps": real_dps,
+        "price_source": df.attrs.get("price_source"),
         "matrix": matrix_table,
-        "buy_step_1": int(buy_step_1) if np.isfinite(buy_step_1) else np.nan,
-        "buy_step_2": int(buy_step_2) if np.isfinite(buy_step_2) else np.nan,
-        "buy_step_3": int(buy_step_3) if np.isfinite(buy_step_3) else np.nan,
+        "buy_step_1": (
+            float(buy_step_1)
+            if np.isfinite(buy_step_1)
+            else np.nan
+        ),
+        "buy_step_2": (
+            float(buy_step_2)
+            if np.isfinite(buy_step_2)
+            else np.nan
+        ),
+        "buy_step_3": (
+            float(buy_step_3)
+            if np.isfinite(buy_step_3)
+            else np.nan
+        ),
         "div_1y": div_1y,
         "div_5y": div_5y,
         "peg_fair": peg_fair,
         "peg_bottom": peg_bottom,
-        "w_div": (int(w_div * 100) if np.isfinite(w_div) else np.nan),
-        "w_growth": (int(w_growth * 100) if np.isfinite(w_growth) else np.nan),
+        "w_div": (
+            float(w_div * 100)
+            if np.isfinite(w_div)
+            else np.nan
+        ),
+        "w_growth": (
+            float(w_growth * 100)
+            if np.isfinite(w_growth)
+            else np.nan
+        ),
         "profile_desc": profile_desc,
         "fin_data": fin_data,
         "safety": safety,
@@ -1574,7 +1868,8 @@ def calculate_multi_period_engine(code, name):
         "chart_payload": chart_payload
     }
 
-# ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
+
+# ---------- GUI 렌더링 함수# ---------- GUI 렌더링 함수 (HTML 문자열 반환) ----------
 def generate_v39_dashboard(query, code=None, name=None):
     if code is None or name is None:
         code, name = get_code_and_name(query)
